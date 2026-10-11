@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+#pragma once
+#include "ui/Browser.h"
+#include "ui/Transport.h"
+#include "ui/Timeline.h"
+#include "ui/Mixer.h"
+#include "ui/MidiEditor.h"
+namespace opentone
+{
+class Editor final : public juce::Component, public juce::DragAndDropContainer, private juce::ChangeListener, private juce::Timer,
+                     public juce::MenuBarModel, public juce::ApplicationCommandTarget,
+                     public EditorPresenter::Dialogs, private juce::KeyListener
+{
+public:
+    explicit Editor(EditorPresenter&);
+    ~Editor() override;
+    void paint(juce::Graphics&) override;
+    void resized() override;
+    void parentHierarchyChanged() override;
+    bool keyPressed(const juce::KeyPress&) override;
+    bool keyStateChanged(bool) override;
+    void requestQuit(void (*done)());
+    bool canReload() const;
+    void getAllCommands(juce::Array<juce::CommandID>&) override;
+    void getCommandInfo(juce::CommandID, juce::ApplicationCommandInfo&) override;
+    bool perform(const InvocationInfo&) override;
+    ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
+    juce::StringArray getMenuBarNames() override;
+    juce::PopupMenu getMenuForIndex(int, const juce::String&) override;
+    void menuItemSelected(int, int) override {}
+private:
+    enum Command { newProject = 1, openProject, saveProject, saveAs, undo, redo, importAudio, audioSettings, quit, selectAll, duplicate, copy, paste, addAudioTrack, addMidiTrack, mixerView, loopSelection };
+    void changeListenerCallback(juce::ChangeBroadcaster*) override;
+    void timerCallback() override;
+    void chooseOpen();
+    void chooseImport();
+    void showDevices(bool plugins = false);
+    void applyColours();
+    void askSaveChanges(std::function<void(EditorPresenter::SaveChoice)>) override;
+    void chooseSaveDirectory(std::function<void(juce::File)>) override;
+    void confirmOverwrite(const juce::File&, std::function<void(bool)>) override;
+    bool textFocused() const;
+    bool keyboardKeyPressed(const juce::KeyPress&);
+    bool keyPressed(const juce::KeyPress&, juce::Component*) override;
+    bool keyStateChanged(bool, juce::Component*) override;
+    void* pluginKeyMonitor = nullptr;
+    bool pluginSpaceHeld = false;
+    class SearchMenu;
+    class PianoGrip;
+    void refreshPanels();
+    void togglePiano();
+    void toggleMixer();
+    void showDevicesMenu(const juce::String&, juce::Component&, bool instrument);
+    void releaseKeyboard(bool all = false);
+    EditorPresenter& presenter;
+    std::unique_ptr<juce::LookAndFeel_V4> theme;
+    juce::ApplicationCommandManager commands;
+    juce::MenuBarComponent menu { this };
+    Browser browser;
+    Transport transport;
+    Timeline timeline;
+    Mixer mixer;
+    juce::TextButton mixerButton {"Mixer"};
+    MidiEditor midiPanel;
+    std::unique_ptr<SearchMenu> searchMenu;
+    std::unique_ptr<PianoGrip> pianoGrip;
+    std::map<int, int> keyboardNotes;
+    juce::String keyboardTrack;
+    juce::Label status;
+    juce::Label performance;
+    double lastTick = juce::Time::getMillisecondCounterHiRes(), lagWindow = lastTick, worstLag = 0, recentLag = 0;
+    std::unique_ptr<juce::FileChooser> chooser;
+    bool choosing = false;
+    int pendingDialogs = 0;
+    juce::Component::SafePointer<juce::DialogWindow> settingsWindow;
+    juce::Component::SafePointer<juce::DocumentWindow> themedWindow;
+};
+}

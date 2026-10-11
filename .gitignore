@@ -1,0 +1,7 @@
+/build/
+/CMakeUserPresets.json
+/.idea/
+/.vscode/
+.DS_Store
+*.user
+__pycache__/
