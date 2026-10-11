@@ -5,3 +5,11 @@
 .DS_Store
 *.user
 __pycache__/
+/cmake-build-*/
+/.cache/
+.env
+.env.*
+!.env.example
+*.py[cod]
+*.log
+Thumbs.db
