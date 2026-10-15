@@ -24,13 +24,14 @@ public:
     {
         juce::StringArray selectedClips;
         std::optional<TimeSelection> timeSelection;
-        std::map<juce::String, int> trackHeights;
+        
         double pixelsPerSecond = 64;
-        bool snap = true, automationView = false;
-        std::map<juce::String, bool> panAutomationView;
+        bool snap = true, automationView = false, follow = false, lockAutomation = false, computerKeyboard = true, drawMode = false, midiMapMode = false, keyMapMode = false, overdub = false, automationRecord = false, punchIn = false, punchOut = false;
+        juce::String midiLearnTarget;
+        std::map<juce::String, int> automationParameters;
         int scrollX = 0, scrollY = 0;
         juce::String selectedTrack, editedMidiClip;
-        juce::StringArray armedTracks;
+        juce::StringArray armedTracks, selectedTracks;
         int pianoHeight = 240; bool pianoOpen = false, mixerOpen = false;
         double pianoZoom = 180; int pianoKeyHeight = 14;
     };
@@ -43,7 +44,7 @@ public:
     const Project& project() const { return session.project(); }
     const juce::File& mediaDirectory() const { return session.mediaDirectory(); }
     juce::String projectName() const
-    { return session.location() == storage.workspace() || session.location() == juce::File() ? juce::String() : session.location().getFileName(); }
+    { return session.location() == storage.workspace() ? importedName : session.location() == juce::File() ? juce::String() : session.location().getFileName(); }
     juce::String windowTitle() const { const auto name = projectName(); return (name.isEmpty() ? juce::String("Untitled") : name) + " - Opentone"; }
     bool dirty() const { return session.dirty(); }
     bool gesturing() const { return session.gesturing(); }
@@ -63,22 +64,36 @@ public:
     void setLoop(double start, double end, bool enabled) { session.setLoop(start, end, enabled); }
     void loopSelection();
     void toggleLoop() { setLoop(project().loopStart, project().loopEnd, !project().loopEnabled); }
-    void copyAutomation(std::vector<AutomationPoint> points, bool pan) { automationClipboard = std::move(points); automationClipboardPan = pan; }
+    void copyAutomation(std::vector<AutomationPoint> points, int parameter) { automationClipboard = std::move(points); automationClipboardParameter = parameter; }
     const std::vector<AutomationPoint>& copiedAutomation() const { return automationClipboard; }
-    bool copiedAutomationPan() const { return automationClipboardPan; }
+    int copiedAutomationParameter() const { return automationClipboardParameter; }
     void setScroll(int x, int y);
     void setTrackHeight(const juce::String&, int height);
-    void selectTrack(const juce::String&);
+    bool trackFolded(const juce::String& id) const { const auto* track = findTrack(project(), id); return track && track->group ? track->groupCollapsed : track && (track->folded || track->height <= 18); }
+    void toggleTrackFold(const juce::String&);
+    void selectTrack(const juce::String&, bool additive = false, bool range = false);
+    void groupSelectedTracks();
+    void createGroup();
+    void ungroupSelectedTrack();
+    void removeFromGroup(const juce::String&);
+    void dropTracks(const juce::String& description, const juce::String& destination);
     void openMidiClip(const juce::String&);
     void setPianoPanel(bool open, int height);
     void setPianoZoom(double zoom, int height)
     { if (!std::isfinite(zoom)) return; state.pianoZoom = juce::jlimit(32.0, 40000.0, zoom); state.pianoKeyHeight = juce::jlimit(8, 48, height); sendChangeMessage(); }
     void setAutomationView(bool enabled) { state.automationView = enabled; sendChangeMessage(); }
-    bool automationPan(const juce::String& id) const
-    { const auto found = state.panAutomationView.find(id); return found != state.panAutomationView.end() && found->second; }
-    void setAutomationPan(const juce::String& id, bool pan) { state.panAutomationView[id] = pan; sendChangeMessage(); }
-    void setAutomation(const juce::String& id, bool pan, std::vector<AutomationPoint> points) { session.setAutomation(id, pan, std::move(points)); }
-    void setPan(const juce::String& id, double pan) { session.setPan(id, pan); }
+    int automationParameter(const juce::String& id) const
+    { const auto found = state.automationParameters.find(id); return found == state.automationParameters.end() ? 0 : found->second; }
+    bool automationPan(const juce::String& id) const { return automationParameter(id) == 1; }
+    void setAutomationParameter(const juce::String& id, int parameter) { state.automationParameters[id] = parameter; sendChangeMessage(); }
+    void setAutomationPan(const juce::String& id, bool pan) { setAutomationParameter(id, pan ? 1 : 0); }
+    const std::vector<AutomationPoint>& automation(const juce::String& id) const
+    { static const std::vector<AutomationPoint> empty; const auto* track = findTrack(project(), id); return track ? automationPoints(*track, automationParameter(id)) : empty; }
+    void setAutomation(const juce::String& id, int parameter, std::vector<AutomationPoint> points) { session.setTrackAutomation(id, parameter, std::move(points)); }
+    void setPan(const juce::String& id, double pan);
+    double trackAutomationValue(const juce::String& id, int parameter) const
+    { const auto* track = findTrack(project(), id); if (!track) return 0; const auto limits = automationLimits(parameter);
+      return juce::jlimit(limits.first, limits.second, automationValue(automationPoints(*track, parameter), position(), automationFallback(*track, parameter))); }
     double trackValue(const juce::String& id, bool pan) const
     { const auto* track = findTrack(project(), id); return track ? automationValue(pan ? track->panAutomation : track->volumeAutomation, position(), pan ? track->pan : track->gain) : 0; }
     void setMixerOpen(bool open) { state.mixerOpen = open; sendChangeMessage(); }
@@ -88,6 +103,9 @@ public:
 
     juce::String addTrack();
     juce::String addMidiTrack();
+    const juce::StringArray& recentProjects() const { return storage.recentProjects(); }
+    void cleanRecentProjects(bool clear)
+    { const auto result = storage.cleanRecentProjects(clear); if (result.failed()) message(result.getErrorMessage()); else sendChangeMessage(); }
     const juce::StringArray& sampleFolders() const { return storage.sampleFolders(); }
     void addSampleFolder(const juce::File& folder) { auto result = storage.addSampleFolder(folder); if (result.failed()) message(result.getErrorMessage()); else sendChangeMessage(); }
     void removeSampleFolder(const juce::File& folder) { auto result = storage.removeSampleFolder(folder); if (result.failed()) message(result.getErrorMessage()); else sendChangeMessage(); }
@@ -107,11 +125,15 @@ public:
     const std::vector<MidiNote>& midiNotesClipboard() const { return midiClipboard; }
     bool previewNote(const juce::String& track, int note, double velocity = 0.8, bool held = false);
     void releasePreview(const juce::String& track, int note) { engine.releasePreview(track, note); }
+    double samplerPosition(const juce::String& id) const { return engine.samplerPosition(id); }
     std::bitset<128> activeNotes(const juce::String& track) const { return engine.activeNotes(track); }
     void previewNotes(const juce::String&, const std::vector<MidiNote>&);
     void inputNoteOn(const juce::String&, int pitch, double velocity = 0.8);
     void inputNoteOff(const juce::String&, int pitch);
-    void armTrack(const juce::String&, bool);
+    void setSend(const juce::String& id, int index, double gain);
+    const std::vector<std::pair<juce::String, juce::String>>& outputChoices() const;
+    void setTrackRouting(const juce::String&, bool input, bool output, int monitor, int channel, juce::String outputTrack = {});
+    void armTrack(const juce::String&, bool, bool additive = false);
     bool armed(const juce::String& track) const { return state.armedTracks.contains(track); }
     void toggleRecording();
     bool recording() const { return !recordTakes.empty(); }
@@ -135,9 +157,38 @@ public:
     void deleteTrack(const juce::String&);
     void controls(const juce::String&, double gain, bool mute);
     void setBpm(double);
+    void tapTempo(double hostTimeMs = 0);
+    void setOutputPair(int pair);
+    void setGroove(double value) { session.setGroove(value); }
+    void setScale(int root, int mode, bool enabled) { session.setScale(root, mode, enabled); }
+    void setCue(double gain) { session.setCue(gain); }
+    void setAutomationLock(bool enabled) { state.lockAutomation = enabled; sendChangeMessage(); }
+    void setFollow(bool enabled) { state.follow = enabled; sendChangeMessage(); }
+    void setComputerKeyboard(bool enabled) { state.computerKeyboard = enabled; sendChangeMessage(); }
+    void setDrawMode(bool enabled) { state.drawMode = enabled; sendChangeMessage(); }
+    void setMidiMapMode(bool);
+    void setKeyMapMode(bool);
+    bool mappedKey(int key, bool down);
+    void releaseMappedKeys();
+    void setOverdub(bool value) { state.overdub = value; sendChangeMessage(); }
+    void setAutomationRecord(bool value) { state.automationRecord = value; sendChangeMessage(); }
+    void setPunch(bool in, bool value) { (in ? state.punchIn : state.punchOut) = value; sendChangeMessage(); }
+    void learnMidi(const juce::String& target);
+    void removeMidiMapping(const juce::String& target) { session.removeMidiMapping(target); }
+    void setLinkEnabled(bool enabled) { engine.enableLink(enabled); sendChangeMessage(); }
+    bool linkEnabled() const { return engine.linkEnabled(); }
+    size_t linkPeers() const { return engine.linkPeers(); }
+    void setLinkStartStopSync(bool enabled) { engine.setLinkStartStopSync(enabled); }
+    bool linkStartStopSync() const { return engine.linkStartStopSync(); }
+    void setLinkQuantum(double quantum) { engine.setLinkQuantum(quantum); }
+    double linkQuantum() const { return engine.linkQuantum(); }
+    void setMeter(int numerator, int denominator) { session.setMeter(numerator, denominator); }
+    void addLocator() { session.addLocator(playing() ? position() : state.timeSelection ? state.timeSelection->start : position()); }
+    void jumpLocator(bool next);
     void insertClip(Clip, bool createTrack);
+    bool insertClips(const std::vector<Clip>& clips) { return session.insertClips(clips); }
     void changeClip(const Clip&);
-    void changeClips(const std::vector<Clip>&);
+    bool changeClips(const std::vector<Clip>&, const std::vector<AutomationEdit>& automation = {});
     void deleteSelection();
     void beginGesture();
     void endGesture(bool cancel);
@@ -163,9 +214,9 @@ public:
     void importFiles(const juce::StringArray&, juce::String track, double start, bool browserOnly = false);
     void requestQuit(void (*done)());
 private:
-    std::vector<AutomationPoint> automationClipboard; bool automationClipboardPan = false;
+    std::vector<AutomationPoint> automationClipboard; int automationClipboardParameter = 0;
     std::vector<MidiNote> midiClipboard;
-    std::optional<Track> trackClipboard; std::vector<Clip> trackClips;
+    std::optional<Track> trackClipboard; std::vector<Clip> trackClips; std::vector<Track> trackChildren;
     struct Clipboard
     {
         std::vector<std::pair<Clip, int>> clips;
@@ -195,18 +246,25 @@ private:
     { for (auto& take : recordTakes) if (take.id == id) return &take; return nullptr; }
     Asset recordAsset;
     juce::File recordFile;
-    double recordStart = 0, lastRecordTime = 0;
+    double recordStart = 0, lastRecordTime = 0, recordEnd = std::numeric_limits<double>::infinity();
     uint64_t recordConfiguration = 0;
-    bool noteLimitReached = false, recordInputOverflow = false, requestingMicrophone = false;
+    bool noteLimitReached = false, automationLimitReached = false, recordInputOverflow = false, requestingMicrophone = false;
     std::map<std::pair<juce::String, juce::String>, size_t> recordingNotes;
-    struct InputEvent { juce::String source; juce::MidiMessage message; double time; };
+    struct InputEvent { juce::String source; juce::MidiMessage message; double time; double hostTimeMs = 0; };
+    bool mappedMidi(const InputEvent&);
+    void recordAutomation(const juce::String&, int parameter, double value);
+    std::set<juce::String> heldMappings;
+    std::vector<double> tempoTaps;
     juce::CriticalSection midiInputLock;
     std::vector<InputEvent> midiInputEvents;
     std::atomic<bool> midiOverflow {false};
     std::set<juce::String> knownMidiInputs;
     struct ControllerNote { juce::StringArray tracks; int pitch; };
     std::map<juce::String, ControllerNote> controllerNotes;
+    std::map<juce::String, juce::StringArray> controllerRoutes;
     double lastMidiScan = 0;
+    mutable uint64_t routeRevision = 0;
+    mutable std::vector<std::pair<juce::String, juce::String>> routeChoices;
     ProjectSession& session;
     Storage& storage;
     AudioEngine& engine;
@@ -215,7 +273,7 @@ private:
     std::optional<Clipboard> clipboard;
     std::vector<Loading> imports;
     std::vector<std::function<void()>> completedImports;
-    juce::String notice;
+    juce::String notice, importedName;
     uint64_t generation = 0, operation = 0;
     double lastPluginCapture = 0;
     bool busySave = false, busyOpen = false;

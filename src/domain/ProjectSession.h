@@ -17,13 +17,20 @@ public:
     Snapshot snapshot() const { return { state, directory, generation, revision }; }
     const juce::File& location() const { return saveLocation; }
     const juce::File& mediaDirectory() const { return directory; }
+    uint64_t editRevision() const { return revision; }
     bool dirty() const { return revision != savedRevision; }
     bool gesturing() const { return gesture.has_value(); }
     std::function<void(const Snapshot&, bool)> onEdit;
 
     bool replace(Project next, juce::File location, bool saved);
     void saved(const Snapshot& captured, const juce::File& location);
-    juce::String addTrack(juce::String name = "Audio", bool midi = false);
+    juce::String addTrack(juce::String name = "Audio", bool midi = false, juce::String parent = {});
+    juce::String groupTracks(const juce::StringArray&);
+    bool ungroup(const juce::String&);
+    bool moveTracks(const juce::StringArray&, const juce::String& group);
+    bool foldGroup(const juce::String&, bool);
+    bool armTrack(const juce::String&, bool);
+    bool trackLayout(const juce::String&, int height, bool folded);
     bool loadSampler(const juce::String& track, const juce::String& asset, double offset, double duration,
                      std::optional<Asset> imported = {});
     bool setRootNote(const juce::String& track, int note);
@@ -42,15 +49,25 @@ public:
     bool setSolo(const juce::String&, bool);
     bool controls(const juce::String& id, double gain, bool mute);
     bool setBpm(double bpm);
+    bool setMeter(int numerator, int denominator);
+    bool setCue(double gain);
+    bool setGroove(double);
+    bool setScale(int root, int mode, bool enabled);
+    bool mapMidi(MidiMapping);
+    bool removeMidiMapping(const juce::String& target);
+    bool addLocator(double time);
     bool setLoop(double start, double end, bool enabled);
+    bool routing(const juce::String&, bool input, bool output, int monitor, int midiChannel, juce::String outputTrack = {});
+    bool setSend(const juce::String&, int index, double gain);
     bool setPan(const juce::String&, double);
     bool setAutomation(const juce::String&, bool pan, std::vector<AutomationPoint>);
+    bool setTrackAutomation(const juce::String&, int parameter, std::vector<AutomationPoint>);
     bool importAsset(Asset asset, std::optional<Clip> clip = {}, bool createTrack = false);
     bool insertClip(Clip clip, bool createTrack = false);
     bool insertClips(const std::vector<Clip>& clips, const std::vector<Track>& tracks = {});
     std::vector<Clip> splitTimeSelection(const TimeSelection&);
     bool changeClip(const Clip& clip);
-    bool changeClips(const std::vector<Clip>& clips);
+    bool changeClips(const std::vector<Clip>& clips, const std::vector<AutomationEdit>& automation = {});
     bool deleteClip(const juce::String& id);
     bool deleteClips(const juce::StringArray& ids);
     void beginGesture();

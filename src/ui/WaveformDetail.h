@@ -50,13 +50,14 @@ public:
         const auto first = std::max(0, static_cast<int>(std::floor(from * sampleRate - static_cast<double>(data->first))) - 1);
         const auto last = std::min(data->count - 1, static_cast<int>(std::ceil(to * sampleRate - static_cast<double>(data->first))) + 1);
         const auto pixelsPerSample = static_cast<double>(area.getWidth()) / ((to - from) * sampleRate);
-        const auto centre = area.getCentreY(), amplitude = area.getHeight() * 0.46f;
-        const auto originalColour = colour;
-        graphics.setColour(originalColour.withMultipliedAlpha(0.22f));
-        graphics.drawHorizontalLine(juce::roundToInt(centre), area.getX(), area.getRight());
-        graphics.setColour(originalColour);
+        const auto channelHeight = area.getHeight() / static_cast<float>(data->samples.getNumChannels());
         for (int channel = 0; channel < data->samples.getNumChannels(); ++channel)
         {
+            const auto centre = area.getY() + (static_cast<float>(channel) + 0.5f) * channelHeight;
+            const auto amplitude = channelHeight * 0.46f;
+            graphics.setColour(colour.withMultipliedAlpha(0.22f));
+            graphics.drawHorizontalLine(juce::roundToInt(centre), area.getX(), area.getRight());
+            graphics.setColour(colour);
             const auto* samples = data->samples.getReadPointer(channel);
             const auto xAt = [&](int i) { return area.getX() + static_cast<float>((static_cast<double>(data->first) + i - from * sampleRate) * pixelsPerSample); };
             const auto yAt = [&](int i) { return centre - juce::jlimit(-1.0f, 1.0f, samples[i]) * amplitude; };
@@ -71,7 +72,7 @@ public:
                     curve.cubicTo(xAt(i) + dx, yAt(i) + (yAt(i + 1) - before) / 6,
                                   xAt(i + 1) - dx, yAt(i + 1) - (after - yAt(i)) / 6, xAt(i + 1), yAt(i + 1));
                 }
-                graphics.strokePath(curve, juce::PathStrokeType(1.5f));
+                graphics.strokePath(curve, juce::PathStrokeType(1.0f));
                 if (pixelsPerSample >= 4) for (int i = first; i <= last; ++i) graphics.fillEllipse(xAt(i) - 2, yAt(i) - 2, 4, 4);
             }
             else

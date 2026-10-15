@@ -17,7 +17,10 @@ public:
     void cancelGesture();
     bool canReload() const { return !choosing; }
     bool pianoVisible() const { return showPiano; }
-    static constexpr int instrumentHeight = 238;
+    static constexpr int instrumentHeight = 218;
+    void scrollDevices(double proportion);
+    void paintDeviceOverview(juce::Graphics&, juce::Rectangle<float>) const;
+    std::pair<double, double> deviceViewRange() const;
     void setKeyboardNotes(std::bitset<128> notes);
     bool noteFocused() const;
     void selectAllNotes();

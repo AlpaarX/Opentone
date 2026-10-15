@@ -16,7 +16,7 @@ namespace opentone
 // Application owns engine and session. Message thread submits immutable snapshots.
 // Worker owns readers/resamplers. Callback owns the clock, ring consumption,
 // mixing and plug-in processing; host edits use a nonblocking callback lock.
-// Shutdown: remove device callback, join preparer, destroy voices, stop read-ahead.
+// Shutdown: remove device callback, join preparer, destroy voices.
 class OPENTONE_API AudioEngine final : public juce::AudioIODeviceCallback
 {
 public:
@@ -26,16 +26,26 @@ public:
     void configureOffline(double rate, int blockSize);
     void submit(const Snapshot&, bool structural = true, bool allowLoop = true);
     void replace(const Snapshot&);
-    void play();
-    void stop();
+    void play(bool broadcast = true);
+    void stop(bool broadcast = true);
+    void enableLink(bool);
+    bool linkEnabled() const;
+    size_t linkPeers() const;
+    double linkTempo() const;
+    void requestLinkTempo(double);
+    void setLinkQuantum(double);
+    double linkQuantum() const;
+    void setLinkStartStopSync(bool);
+    bool linkStartStopSync() const;
+    int linkRemoteTransport();
     void seek(double seconds);
     void render(float* const* output, int channels, int samples) noexcept;
-    bool playing() const { return running.load(); }
+    bool playing() const;
     double position() const { return static_cast<double>(playbackFrame(clock.load())) / sampleRate.load(); }
     double rate() const { return sampleRate.load(); }
     uint64_t deviceConfiguration() const { return configuration.load(); }
     juce::Result enableMicrophone();
-    juce::Result startAudioRecording(const juce::File&, double start);
+    juce::Result startAudioRecording(const juce::File&, double start, double end = -1);
     juce::Result finishAudioRecording();
     bool recordingFailed() const { return recordFailed.load(); }
     juce::int64 recordedFrames() const { return recordFrames.load(); }
@@ -53,6 +63,7 @@ public:
     bool previewNote(const Track&, const Asset&, const juce::File&, int note, double velocity, bool held, bool replace = true);
     void releaseEditPreviews(const juce::String&);
     void releasePreview(const juce::String& track, int note);
+    double samplerPosition(const juce::String&) const;
     std::bitset<128> activeNotes(const juce::String& track) const;
     juce::String error() const;
     static bool isRendering() noexcept { return rendering; }
@@ -68,6 +79,9 @@ public:
     void audioDeviceIOCallbackWithContext(const float* const*, int, float* const*, int, int,
                                           const juce::AudioIODeviceCallbackContext&) override;
 private:
+    class LinkState;
+    std::unique_ptr<LinkState> linkState;
+    int syncLink(int samples) noexcept;
     static constexpr int chunk = 256, ringSize = 64, retireSize = 16;
     static thread_local bool rendering;
     struct Control
@@ -75,6 +89,7 @@ private:
         std::shared_ptr<PluginHost::Bus> bus;
         std::atomic<float> target { 1 }, panTarget {0}; float current = 1;
         std::atomic<float> samplerTarget { 1 };
+        std::atomic<double> samplerCursor {-1}, samplerEnd {0};
         std::atomic<uint64_t> notesLow { 0 }, notesHigh { 0 };
         uint64_t localLow = 0, localHigh = 0;
         void clearNotes() { localLow = localHigh = 0; }
@@ -112,12 +127,14 @@ private:
         std::vector<PreviewRequest> previews;
     };
     void workerLoop();
+    int startupBlocks() const noexcept { return juce::jlimit(8, ringSize - 1, 2 * ((quantum.load() + chunk - 1) / chunk)); }
     std::unique_ptr<Arrangement> prepare(const Request&, Arrangement* base);
     void resetResources();
     void startWorker();
     void retire(Arrangement*) noexcept;
     bool retirementAvailable() const noexcept;
     void setError(juce::String);
+    const float* const* liveInput = nullptr; int liveInputChannels = 0, liveInputOffset = 0;
     bool pluginBlock = false;
     juce::int64 playbackFrame(juce::int64 frame) const noexcept
     { if (!looping.load()) return frame; const auto start = static_cast<juce::int64>(std::llround(loopStart.load() * sampleRate.load()));
@@ -137,6 +154,8 @@ private:
     std::atomic<float> masterTarget { 1 }, masterPanTarget {0};
     std::atomic<bool> metronomeEnabled { false };
     std::atomic<double> tempo { 120 };
+    std::atomic<float> cueTarget {1};
+    std::atomic<int> numerator {4}, denominator {4};
     float masterCurrent = 1;
     std::atomic<Arrangement*> pending { nullptr }, activeView { nullptr };
     Arrangement* active = nullptr;
@@ -149,10 +168,9 @@ private:
     mutable std::mutex errorMutex;
     juce::String lastError;
     std::thread worker;
-    juce::TimeSliceThread readAhead { "Audio read-ahead" };
     juce::TimeSliceThread recordThread { "Audio recording" };
     std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> recordWriter;
-    juce::int64 recordStart = 0;
+    juce::int64 recordStart = 0, recordEnd = std::numeric_limits<juce::int64>::max();
     std::atomic<bool> recordFailed {false};
     std::atomic<juce::int64> recordFrames {0};
     std::atomic<juce::int64> recordFirstFrame {0};

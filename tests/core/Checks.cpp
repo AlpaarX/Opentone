@@ -330,7 +330,9 @@ void audioChecks()
     snapshot.project.clips = { { "clip", "track", asset, 512.0 / 48000, 128.0 / 48000, 1024.0 / 48000 },
                               { "overlap", "track", asset, 768.0 / 48000, 0, 512.0 / 48000 } };
     AudioEngine engine; engine.configureOffline(48000, 256); engine.replace(snapshot);
-    juce::AudioBuffer<float> buffer(2, 256); awaitRevision(engine, 1, buffer); engine.play();
+    juce::AudioBuffer<float> buffer(2, 256); awaitRevision(engine, 1, buffer);
+    engine.seek(0); engine.play();
+    check(engine.playing(), "Play at the prepared cursor starts without another preparation");
     render(engine, buffer); near(buffer.getMagnitude(0, 256), 0, 0, "gap block 1");
     render(engine, buffer); near(buffer.getMagnitude(0, 256), 0, 0, "gap block 2");
     render(engine, buffer); near(buffer.getSample(0, 0), 0.1 + 128.0 / 200000, 2.0e-6, "source offset");
@@ -339,8 +341,10 @@ void audioChecks()
     render(engine, buffer); render(engine, buffer);
     check(engine.playing(), "playback continues past arrangement end"); near(engine.position(), 1536.0 / 48000, 1.0e-9, "end clock");
     engine.stop();
+    engine.pausePreparation.store(true);
     engine.seek(0.012); awaitRevision(engine, 1, buffer);
     for (int i = 0; i < 200 && std::abs(engine.position() - 0.012) > 1.0e-9; ++i) { render(engine, buffer); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+    engine.pausePreparation.store(false);
     near(engine.position(), 0.012, 1.0e-9, "seek paused");
     snapshot.project.clips = { { "clip", "track", asset, 0, 0, 3 } }; ++snapshot.revision;
     engine.replace(snapshot); awaitRevision(engine, 2, buffer); engine.play();

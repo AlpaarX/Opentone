@@ -13,7 +13,7 @@ struct UiApi
     bool (*canReload)(juce::Component&);
     void (*requestQuit)(juce::Component&, void (*done)());
 };
-constexpr uint32_t uiAbiVersion = 22;
+constexpr uint32_t uiAbiVersion = 42;
 }
 
 #if defined(_WIN32) && defined(OPENTONE_UI_MODULE_BUILD)

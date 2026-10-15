@@ -16,32 +16,37 @@ public:
     juce::var getDragSourceDescription(const juce::SparseSet<int>&) override;
     void listBoxItemDoubleClicked(int, const juce::MouseEvent&) override;
     void listBoxItemClicked(int, const juce::MouseEvent&) override;
+    void selectedRowsChanged(int) override;
     void returnKeyPressed(int row) override { activate(row); }
     void resized() override;
     void paint(juce::Graphics&) override;
     bool keyPressed(const juce::KeyPress&) override;
     void refresh();
-    bool canReload() const { return !choosing; }
+    bool canReload() const { return !choosing && searchPool.getNumJobs() == 0; }
 private:
-    enum class Category { sounds, instruments, effects };
-    struct Row { juce::String name, drag, format; bool plugin = false; };
+    enum class Category { sounds, instruments, effects, plugins };
+    struct Row { juce::String name, drag, format; bool plugin = false; juce::String brand; bool folder = false; };
     class Folder;
-    void selectCategory(Category);
+    class Preview;
+    void selectCategory(Category, juce::String folder = {});
+    void rebuildPlaces();
+    void searchFiles();
     void chooseFolder();
     void updateSource();
     void activate(int);
+    void toggleBrand(const juce::String&);
     void useFile(const juce::File&);
     void selectionChanged() override;
     void fileClicked(const juce::File&, const juce::MouseEvent&) override {}
     void fileDoubleClicked(const juce::File&) override;
     void browserRootChanged(const juce::File&) override {}
     EditorPresenter& presenter;
-    juce::Label title, empty;
+    juce::Label title, empty, contentsTitle;
     juce::TreeView categories;
     std::unique_ptr<Folder> root;
-    juce::ComboBox locations;
     juce::TextEditor search;
-    juce::TextButton addFolder {"+ Folder"}, removeFolder {"-"};
+    juce::TextButton addFolder {"Add Folder..."};
+    std::unique_ptr<Preview> preview;
     juce::ListBox list {"Library items", this};
     juce::WildcardFileFilter filter {"*.wav;*.aif;*.aiff;*.flac;*.mp3", "*", "Audio files"};
     juce::TimeSliceThread directoryThread {"Sample folders"};
@@ -49,6 +54,13 @@ private:
     juce::FileTreeComponent files {directory};
     juce::StringArray cachedFolders;
     std::vector<Row> rows;
+    juce::StringArray expandedBrands, collapsedSearchBrands;
+    juce::String brandQuery;
+    juce::ThreadPool searchPool {1};
+    std::shared_ptr<std::atomic<unsigned>> searchGeneration = std::make_shared<std::atomic<unsigned>>(0);
+    juce::String selectedFolder, searchDirectory, searchQuery;
+    juce::Array<juce::File> foundFiles;
+    bool searching = false;
     Category category = Category::sounds;
     std::unique_ptr<juce::FileChooser> chooser;
     bool choosing = false, folderAvailable = false;

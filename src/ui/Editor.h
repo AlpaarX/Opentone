@@ -27,14 +27,14 @@ public:
     ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
     juce::StringArray getMenuBarNames() override;
     juce::PopupMenu getMenuForIndex(int, const juce::String&) override;
-    void menuItemSelected(int, int) override {}
+    void menuItemSelected(int, int) override;
 private:
-    enum Command { newProject = 1, openProject, saveProject, saveAs, undo, redo, importAudio, audioSettings, quit, selectAll, duplicate, copy, paste, addAudioTrack, addMidiTrack, mixerView, loopSelection };
+    enum Command { newProject = 1, openProject, saveProject, saveAs, undo, redo, importAudio, audioSettings, quit, selectAll, duplicate, copy, paste, addAudioTrack, addMidiTrack, mixerView, loopSelection, importNotes, groupTracks, ungroupTracks, midiMapping, keyMapping };
     void changeListenerCallback(juce::ChangeBroadcaster*) override;
     void timerCallback() override;
     void chooseOpen();
     void chooseImport();
-    void showDevices(bool plugins = false);
+    void showDevices(bool plugins = false, bool audio = false);
     void applyColours();
     void askSaveChanges(std::function<void(EditorPresenter::SaveChoice)>) override;
     void chooseSaveDirectory(std::function<void(juce::File)>) override;
@@ -46,8 +46,12 @@ private:
     void* pluginKeyMonitor = nullptr;
     bool pluginSpaceHeld = false;
     class SearchMenu;
-    class PianoGrip;
+    class DetailGrip;
+    class MappingOverlay;
+    class BrowserGrip;
+    class DeviceOverview;
     void refreshPanels();
+    void refreshFooter();
     void togglePiano();
     void toggleMixer();
     void showDevicesMenu(const juce::String&, juce::Component&, bool instrument);
@@ -60,16 +64,25 @@ private:
     Transport transport;
     Timeline timeline;
     Mixer mixer;
-    juce::TextButton mixerButton {"Mixer"};
+    juce::TextButton mixerButton {"Mixer"}, browserButton {"Browser"};
+    juce::TextButton infoButton {"Info"}, detailButton {"Detail view"}, viewButton {"Clip / Device"}, selectedTrackButton {"Selected track"};
+    bool infoVisible = false;
+    bool browserOpen = true;
+    int browserWidth = 360;
+    bool detailOpen = true;
     MidiEditor midiPanel;
     std::unique_ptr<SearchMenu> searchMenu;
-    std::unique_ptr<PianoGrip> pianoGrip;
+    std::unique_ptr<DetailGrip> detailGrip;
+    std::unique_ptr<MappingOverlay> mappingOverlay;
+    std::unique_ptr<BrowserGrip> browserGrip;
+    std::unique_ptr<DeviceOverview> deviceOverview;
     std::map<int, int> keyboardNotes;
     juce::String keyboardTrack;
     juce::Label status;
     juce::Label performance;
     double lastTick = juce::Time::getMillisecondCounterHiRes(), lagWindow = lastTick, worstLag = 0, recentLag = 0;
     std::unique_ptr<juce::FileChooser> chooser;
+    juce::StringArray recentMenuFiles;
     bool choosing = false;
     int pendingDialogs = 0;
     juce::Component::SafePointer<juce::DialogWindow> settingsWindow;

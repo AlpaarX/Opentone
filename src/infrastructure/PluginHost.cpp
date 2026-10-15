@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "infrastructure/PluginHost.h"
+#include "infrastructure/BuiltinPlugins.h"
 
 namespace opentone
 {
@@ -123,7 +124,7 @@ juce::Array<juce::PluginDescription> PluginHost::availablePlugins() const
 {
     auto result = known.getTypes();
     for (auto& plugin : result) if (const auto found = categories.find(plugin.createIdentifierString()); found != categories.end()) plugin.isInstrument = found->second;
-    result.add(utilityDescription()); return result;
+    result.add(utilityDescription()); result.addArray(builtinPluginDescriptions()); return result;
 }
 void PluginHost::assignCategory(const juce::String& identifier, bool instrument)
 {
@@ -181,7 +182,7 @@ void PluginHost::prepareSlot(Slot& slot)
 void PluginHost::prepare(double nextRate, int nextBlock)
 {
     const juce::ScopedLock lock(mutex); rate = nextRate; block = std::max(1, nextBlock); expectedFrame = -1;
-    for (auto& pair : buses) pair.second->audio.setSize(2, block);
+    for (auto& pair : buses) { pair.second->audio.setSize(2, block); pair.second->feedback.setSize(2, block); pair.second->feedback.clear(); }
     for (auto& pair : slots) if (pair.second->instance)
     { pair.second->instance->releaseResources(); prepareSlot(*pair.second); }
 }
@@ -190,6 +191,9 @@ void PluginHost::load(const std::shared_ptr<Slot>& slot)
     juce::PluginDescription description;
     const auto xml = juce::XmlDocument::parse(slot->model.description);
     if (!xml || !description.loadFromXml(*xml) || description.isInstrument != slot->model.instrument) { slot->loading = false; slot->error = "Invalid plug-in description."; return; }
+    if (description.pluginFormatName == "Ableton Live")
+    { slot->loading = false; slot->error = "Unavailable Live device: " + description.descriptiveName; return; }
+    slot->builtin = description.pluginFormatName == "Opentone";
     juce::WeakReference<PluginHost> owner(this); const auto generation = projectGeneration;
     auto loaded = [owner, slot, generation](std::unique_ptr<juce::AudioProcessor> instance, const juce::String& error)
     {
@@ -204,7 +208,7 @@ void PluginHost::load(const std::shared_ptr<Slot>& slot)
     };
     if (description.pluginFormatName == "Opentone")
     { if (description.fileOrIdentifier == "opentone.utility") loaded(std::make_unique<Utility>(), {});
-      else loaded(nullptr, "Unknown built-in effect."); }
+      else { auto instance = createBuiltinPlugin(description.fileOrIdentifier); const auto error = instance ? juce::String() : juce::String("Unknown built-in device."); loaded(std::move(instance), error); } }
     else formats.createPluginInstanceAsync(description, rate, block, std::move(loaded));
 }
 void PluginHost::sync(const Project& project, uint64_t generation, bool allowLoop)
@@ -212,21 +216,33 @@ void PluginHost::sync(const Project& project, uint64_t generation, bool allowLoo
     std::vector<std::shared_ptr<Slot>> loading;
     {
         const juce::ScopedLock lock(mutex);
-        looping = project.loopEnabled && allowLoop; loopStart = project.loopStart; loopEnd = project.loopEnd;
+        numerator = project.numerator; denominator = project.denominator; looping = project.loopEnabled && allowLoop; loopStart = project.loopStart; loopEnd = project.loopEnd;
         if (generation != projectGeneration)
         { windows.clear(); for (auto& pair : slots) if (pair.second->instance) pair.second->instance->removeListener(this);
           slots.clear(); buses.clear(); projectGeneration = generation; expectedFrame = -1; }
         std::set<juce::String> retained, tracks;
-        const bool solo = std::any_of(project.tracks.begin(), project.tracks.end(), [](const auto& track) { return track.solo; });
+        const bool solo = std::any_of(project.tracks.begin(), project.tracks.end(), [](const auto& track) { return track.returnIndex < 0 && track.solo; });
+        soloReturn = std::any_of(project.tracks.begin(), project.tracks.end(), [](const auto& track) { return track.returnIndex >= 0 && track.solo; });
+        returnBuses.assign(static_cast<size_t>(returnCount(project)), nullptr); processingOrder.clear();
+        for (auto& pair : buses) pair.second->parent.reset();
         for (const auto* item : allTracks(project))
         {
             const auto& track = *item;
             tracks.insert(track.id); auto& input = buses[track.id];
-            if (!input) { input = std::make_shared<Bus>(); input->audio.setSize(2, block); input->midi.ensureSize(65536); input->queued.ensureSize(4096); }
-            input->muted = track.mute || (track.id != "master" && solo && !track.solo);
+            if (!input) { input = std::make_shared<Bus>(); input->audio.setSize(2, block); input->feedback.setSize(2, block); input->feedback.clear(); input->midi.ensureSize(65536); input->queued.ensureSize(4096); }
+            input->group = track.group; input->inputEnabled = !track.midi && track.inputEnabled; input->outputEnabled = track.outputEnabled; input->monitor = track.monitor;
+            input->returnIndex = track.returnIndex;
+            input->sends.resize(returnBuses.size(), 0); input->previousSends.resize(returnBuses.size(), 0);
+            for (size_t index = 0; index < returnBuses.size(); ++index) input->sends[index] = index < track.sends.size() ? static_cast<float>(track.sends[index]) : 0;
+            if (track.returnIndex >= 0) returnBuses[static_cast<size_t>(track.returnIndex)] = input;
+            bool soloPath = track.solo;
+            if (track.returnIndex < 0 && track.id != "master" && solo)
+                for (const auto& other : project.tracks) if (other.solo && other.returnIndex < 0)
+                    if (routesTo(project, track, other.id) || routesTo(project, other, track.id) || inGroup(project, track, other.id) || (track.group && inGroup(project, other, track.id))) soloPath = true;
+            input->muted = (track.mute && track.muteAutomation.empty()) || mutedByGroup(project, track) || (track.id != "master" && (track.returnIndex >= 0 ? soloReturn && !track.solo : solo && !soloPath));
             input->baseGain = static_cast<float>(track.gain); input->basePan = static_cast<float>(track.pan);
             input->target = input->muted ? 0 : input->baseGain;
-            input->volumeAutomation = track.volumeAutomation; input->panAutomation = track.panAutomation; 
+            input->volumeAutomation = track.volumeAutomation; input->panAutomation = track.panAutomation; input->muteAutomation = track.muteAutomation; input->sendAutomation = track.sendAutomation; input->sendAutomation.resize(returnBuses.size()); 
             bool changed = input->slots.size() != track.plugins.size();
             if (!changed) for (size_t i = 0; i < track.plugins.size(); ++i) if (input->slots[i]->model.id != track.plugins[i].id) changed = true;
             if (changed) input->chase = true;
@@ -243,6 +259,14 @@ void PluginHost::sync(const Project& project, uint64_t generation, bool allowLoo
                 slot->track = track.id; input->slots.push_back(slot);
             }
         }
+        std::vector<std::pair<int, std::shared_ptr<Bus>>> ordered;
+        for (const auto& track : project.tracks) if (track.returnIndex < 0)
+        {
+            auto input = buses.at(track.id); const auto destination = outputDestination(track); if (destination.isNotEmpty()) input->parent = buses.at(destination);
+            ordered.push_back({routingDepth(project, track), input});
+        }
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (const auto& item : ordered) processingOrder.push_back(item.second);
         for (auto it = buses.begin(); it != buses.end();) if (!tracks.count(it->first)) it = buses.erase(it); else ++it;
         for (auto it = slots.begin(); it != slots.end();)
             if (!retained.count(it->first))
@@ -262,8 +286,13 @@ void PluginHost::beginBlock(juce::int64 nextFrame, double nextBpm, bool nextPlay
     transport(nextFrame, nextBpm, nextPlaying);
     for (auto& pair : buses)
     {
-        auto& input = *pair.second; input.audio.clear(); input.midi.clear();
-        input.target = input.muted ? 0 : static_cast<float>(automationValue(input.volumeAutomation, static_cast<double>(frame) / rate, input.baseGain));
+        auto& input = *pair.second; input.audio.clear();
+        if (input.returnIndex >= 0) for (int channel = 0; channel < 2; ++channel) input.audio.copyFrom(channel, 0, input.feedback.getReadPointer(channel), samples);
+        input.feedback.clear(); input.midi.clear();
+        bool ancestorMuted = false;
+        for (auto parent = input.parent; parent; parent = parent->parent) if (parent->muted || automationValue(parent->muteAutomation, static_cast<double>(frame) / rate, 0) >= 0.5) { ancestorMuted = true; break; }
+        input.target = ancestorMuted || input.muted || automationValue(input.muteAutomation, static_cast<double>(frame) / rate, 0) >= 0.5 ? 0 : static_cast<float>(automationValue(input.volumeAutomation, static_cast<double>(frame) / rate, input.baseGain));
+        for (size_t index = 0; index < input.sends.size(); ++index) input.sends[index] = static_cast<float>(juce::jlimit(0.0, maxSendGain, automationValue(input.sendAutomation[index], static_cast<double>(frame) / rate, input.sends[index])));
         input.pan = static_cast<float>(automationValue(input.panAutomation, static_cast<double>(frame) / rate, input.basePan));
         input.midi.addEvents(input.queued, 0, -1, 0); input.queued.clear();
         uint64_t low = 0, high = 0;
@@ -276,6 +305,21 @@ void PluginHost::beginBlock(juce::int64 nextFrame, double nextBpm, bool nextPlay
         }
         input.low.store(low); input.high.store(high);
     }
+}
+void PluginHost::setArmed(const juce::StringArray& tracks)
+{
+    const juce::ScopedLock lock(mutex);
+    for (auto& [id, bus] : buses) bus->armed = tracks.contains(id);
+}
+void PluginHost::monitorInput(const float* const* input, int channels, int offset, int samples)
+{
+    jassert(samples <= block && offset >= 0);
+    const float* source = nullptr;
+    for (int channel = 0; channel < channels; ++channel) if (input[channel]) { source = input[channel] + offset; break; }
+    if (!source) return;
+    for (auto& [id, bus] : buses)
+        if (id != "master" && bus->inputEnabled && (bus->monitor == 0 || (bus->monitor == 1 && bus->armed)))
+            for (int channel = 0; channel < 2; ++channel) bus->audio.addFrom(channel, 0, source, samples);
 }
 void PluginHost::finishBlock(float* const* output, int channels, int samples, float master, float masterPan)
 {
@@ -297,8 +341,10 @@ void PluginHost::finishBlock(float* const* output, int channels, int samples, fl
             if (instance.getTotalNumOutputChannels() == 1) input.audio.copyFrom(1, 0, input.audio, 0, 0, samples);
         }
         const auto end = static_cast<double>(frame + (playing ? samples : 0)) / rate;
-        const auto gain = input.muted ? 0.0f : static_cast<float>(automationValue(input.volumeAutomation, end, isMaster ? master : input.baseGain));
-        const auto pan = static_cast<float>(automationValue(input.panAutomation, end, isMaster ? masterPan : input.basePan));
+        bool ancestorMuted = false;
+        for (auto parent = input.parent; parent; parent = parent->parent) if (parent->muted || automationValue(parent->muteAutomation, end, 0) >= 0.5) { ancestorMuted = true; break; }
+        const auto gain = ancestorMuted || input.muted || automationValue(input.muteAutomation, end, 0) >= 0.5 ? 0.0f : static_cast<float>(juce::jlimit(0.0, 2.0, automationValue(input.volumeAutomation, end, isMaster ? master : input.baseGain)));
+        const auto pan = static_cast<float>(juce::jlimit(-1.0, 1.0, automationValue(input.panAutomation, end, isMaster ? masterPan : input.basePan)));
         for (int channel = 0; channel < 2; ++channel)
             input.audio.applyGainRamp(channel, 0, samples, input.previousGain * panGain(input.previousPan, channel), gain * panGain(pan, channel));
         input.previousGain = gain; input.previousPan = pan;
@@ -306,13 +352,35 @@ void PluginHost::finishBlock(float* const* output, int channels, int samples, fl
         input.peakRight.store(std::max(input.audio.getMagnitude(1, 0, samples), input.peakRight.load() * decay));
         input.chase = false;
     };
-    for (auto& pair : buses)
+    const auto mix = [&](Bus& input)
+    { if (input.outputEnabled) for (int channel = 0; channel < std::min(channels, 2); ++channel) if (output[channel])
+        juce::FloatVectorOperations::add(output[channel], input.audio.getReadPointer(channel), samples); };
+    for (const auto& bus : processingOrder)
     {
-        if (pair.first == "master") continue;
-        auto& input = *pair.second; process(input, false);
-        for (int channel = 0; channel < std::min(channels, 2); ++channel) if (output[channel])
-            juce::FloatVectorOperations::add(output[channel], input.audio.getReadPointer(channel), samples);
+        auto& input = *bus; process(input, false);
+        for (size_t index = 0; index < returnBuses.size(); ++index)
+        {
+            if (returnBuses[index])
+            {
+                jassert(returnBuses[index]->returnIndex == static_cast<int>(index) && returnBuses[index].get() != &input);
+                for (int channel = 0; channel < 2; ++channel)
+                    returnBuses[index]->audio.addFromWithRamp(channel, 0, input.audio.getReadPointer(channel), samples, input.previousSends[index], input.sends[index]);
+            }
+            input.previousSends[index] = input.sends[index];
+        }
+        if (input.parent)
+        { jassert(input.parent.get() != &input);
+          if (input.outputEnabled && (input.parent->group || input.parent->returnIndex >= 0 || input.parent->monitor == 0 || (input.parent->monitor == 1 && input.parent->armed))) for (int channel = 0; channel < 2; ++channel) input.parent->audio.addFrom(channel, 0, input.audio.getReadPointer(channel), samples); }
+        else if (!soloReturn) mix(input);
     }
+    for (const auto& bus : returnBuses) if (bus) { process(*bus, false); mix(*bus); }
+    // Return feedback is delayed one block; bound the feedback path before the next pass.
+    for (const auto& bus : returnBuses) if (bus) for (size_t index = 0; index < returnBuses.size(); ++index)
+    { if (const auto& target = returnBuses[index]) for (int channel = 0; channel < 2; ++channel)
+        target->feedback.addFromWithRamp(channel, 0, bus->audio.getReadPointer(channel), samples, bus->previousSends[index], bus->sends[index]);
+      bus->previousSends[index] = bus->sends[index]; }
+    for (const auto& bus : returnBuses) if (bus) for (int channel = 0; channel < 2; ++channel)
+      for (int sample = 0; sample < samples; ++sample) { auto& value = bus->feedback.getWritePointer(channel)[sample]; value = std::isfinite(value) ? juce::jlimit(-16.0f, 16.0f, value) : 0; }
     if (const auto found = buses.find("master"); found != buses.end())
     {
         auto& input = *found->second;
@@ -330,8 +398,8 @@ juce::Optional<juce::AudioPlayHead::PositionInfo> PluginHost::getPosition() cons
     juce::AudioPlayHead::PositionInfo info;
     const auto seconds = static_cast<double>(frame) / rate, beats = seconds * bpm / 60;
     info.setTimeInSamples(frame); info.setTimeInSeconds(seconds); info.setBpm(bpm);
-    info.setTimeSignature(juce::AudioPlayHead::TimeSignature {4, 4});
-    info.setPpqPosition(beats); info.setPpqPositionOfLastBarStart(std::floor(beats / 4) * 4);
+    info.setTimeSignature(juce::AudioPlayHead::TimeSignature {numerator, denominator});
+    info.setPpqPosition(beats); info.setPpqPositionOfLastBarStart(std::floor(beats / (numerator * 4.0 / denominator)) * (numerator * 4.0 / denominator));
     info.setIsPlaying(playing); info.setIsRecording(false); info.setIsLooping(looping);
     info.setLoopPoints(juce::AudioPlayHead::LoopPoints {loopStart * bpm / 60, loopEnd * bpm / 60});
     return info;
@@ -347,6 +415,10 @@ bool PluginHost::preview(const juce::String& track, int pitch, double velocity, 
     input->queued.addEvent(juce::MidiMessage::noteOn(1, pitch, static_cast<float>(velocity)), 0);
     note = {true, held, previewClock + static_cast<juce::int64>(rate * 0.25), static_cast<float>(velocity)}; return true;
 }
+void PluginHost::liveMidi(const juce::String& track, const juce::MidiMessage& midi)
+{ const juce::ScopedLock lock(mutex); if (auto input = bus(track)) { auto value = midi; value.setChannel(1); input->queued.addEvent(value, 0); } }
+std::shared_ptr<PluginHost::Slot> PluginHost::editorSlot(const juce::String& id) const
+{ const juce::ScopedLock lock(mutex); const auto found = slots.find(id); return found == slots.end() ? nullptr : found->second; }
 void PluginHost::release(const juce::String& track, int pitch, bool editsOnly)
 {
     const juce::ScopedLock lock(mutex); const auto input = bus(track); if (!input) return;
@@ -388,6 +460,7 @@ void PluginHost::updateEditorWindowLevels()
 void PluginHost::showEditor(const juce::String& id)
 {
     const auto found = slots.find(id); if (found == slots.end() || !found->second->instance) return;
+    if (found->second->builtin && found->second->instance->getActiveEditor() && !windows.count(id)) return;
     auto& window = windows[id];
     if (!window)
     { auto& instance = *found->second->instance;

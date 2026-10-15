@@ -16,7 +16,7 @@ public:
     const Clip* clip() const { return findId(owner.presenter.project().clips, owner.clipId); }
     void updatePlayback()
     {
-        const auto* value = clip(); const auto position = owner.presenter.position();
+        const auto* value = clip(); const auto position = value && value->scene < 0 ? owner.presenter.position() : -1;
         const bool visible = owner.showPiano && value && position >= value->start && position < value->start + value->duration;
         if (visible)
         {
@@ -95,7 +95,7 @@ public:
     void paste(const std::vector<MidiNote>& notes, double at)
     {
         const auto* value = clip(); if (!value || notes.empty()) return;
-        if (value->notes.size() + notes.size() > 512) { owner.presenter.message("MIDI clips support up to 512 notes."); return; }
+        if (value->notes.size() + notes.size() > maxMidiNotes) { owner.presenter.message("MIDI clips support up to 4096 notes."); return; }
         auto edited = *value; const auto first = edited.notes.size();
         for (auto note : notes) { note.start += std::max(0.0, at); edited.notes.push_back(note); }
         owner.presenter.changeClip(edited); selected.clear();
@@ -141,10 +141,13 @@ public:
         {
             const auto y = (127 - pitch) * keyHeight();
             const bool black = juce::MidiMessage::isMidiNoteBlack(pitch);
-            g.setColour(black ? panel : background.brighter(0.08f)); g.fillRect(0, y, getWidth(), keyHeight());
+            g.setColour(black ? background.darker(0.12f) : background.brighter(0.05f)); g.fillRect(0, y, getWidth(), keyHeight());
+            const auto& project = owner.presenter.project();
+            const auto degree = (pitch - project.scaleRoot + 120) % 12; const auto mask = project.scaleMode == 0 ? 0xab5 : 0x5ad;
+            if (project.scaleEnabled && (mask & (1 << degree)) == 0) { g.setColour(juce::Colours::black.withAlpha(0.15f)); g.fillRect(0, y, getWidth(), keyHeight()); }
             const bool pushed = owner.activeNotes.test(static_cast<size_t>(pitch));
-            g.setColour(pushed ? trackColour(owner.trackId) : black ? juce::Colours::black : juce::Colours::white); g.fillRect(keysX, y, keyWidth, keyHeight() - 1);
-            if (pitch % 12 == 0) { g.setColour(pushed ? trackColour(owner.trackId).contrasting() : juce::Colours::black); g.setFont(juce::FontOptions(static_cast<float>(std::min(10, keyHeight() - 1))));
+            g.setColour(pushed ? trackColour(owner.presenter.project(), owner.trackId) : black ? uiTone(UiTone::pianoBlack) : uiTone(UiTone::pianoWhite)); g.fillRect(keysX, y, keyWidth, keyHeight() - 1);
+            if (pitch % 12 == 0) { g.setColour(pushed ? trackColour(owner.presenter.project(), owner.trackId).contrasting() : uiTone(UiTone::pianoWhite).contrasting()); g.setFont(juce::FontOptions(static_cast<float>(std::min(10, keyHeight() - 1))));
                 g.drawText(juce::MidiMessage::getMidiNoteName(pitch, true, true, 4), keysX + 3, y, keyWidth - 4, keyHeight(), juce::Justification::centredLeft); }
         }
         g.reduceClipRegion(keysX + keyWidth, 0, getWidth() - keysX - keyWidth, getHeight());
@@ -164,12 +167,13 @@ public:
             for (size_t i = 0; i < value->notes.size(); ++i)
             {
                 const auto r = visibleBounds(value->notes[i], *value);
-                g.setColour(trackColour(owner.trackId)); g.fillRect(r);
+                const auto colour = clipColour(owner.presenter.project(), *value);
+                g.setColour(value->notes[i].enabled && value->notes[i].probability > 0 ? colour : colour.withMultipliedSaturation(0.1f).darker(0.3f)); g.fillRect(r);
                 g.setColour(ink); g.drawRect(r, selected.count(i) ? 2 : 1);
                 if (selected.count(i)) { g.setColour(juce::Colours::white); g.drawRect(r.reduced(2), 1); }
             }
             if (mode == 3)
-            { const auto box = selectionBox(); g.setColour(trackColour(owner.trackId).withAlpha(0.3f)); g.fillRect(box);
+            { const auto box = selectionBox(); g.setColour(trackColour(owner.presenter.project(), owner.trackId).withAlpha(0.3f)); g.fillRect(box);
               g.setColour(ink); g.drawRect(box, 1); }
             if (selected.empty()) { g.setColour(ink.withAlpha(0.6f)); g.drawVerticalLine(static_cast<int>(std::min(static_cast<double>(getWidth()), keyWidth + insertTime * zoom())),
                 static_cast<float>(visible.getY()), static_cast<float>(visible.getBottom())); }
@@ -197,24 +201,28 @@ public:
         const auto* value = clip(); if (!value || owner.presenter.gesturing()) return;
         pruneSelection(); before = selected; active = hit(e.position); down = last = e.position;
         insertTime = active >= 0 ? value->notes[static_cast<size_t>(active)].start : time(e.position.x);
-        additive = e.mods.isShiftDown() || e.mods.isCommandDown(); dragged = false;
+        additive = e.mods.isShiftDown() || e.mods.isCommandDown() || e.mods.isCtrlDown(); dragged = false;
+        copying = e.mods.isAltDown();
         if (e.mods.isRightButtonDown())
         { if (active >= 0) { if (!selected.count(static_cast<size_t>(active))) selected = { static_cast<size_t>(active) }; removeSelected(); } return; }
         if (!e.mods.isLeftButtonDown()) return;
+        if (owner.presenter.viewState().drawMode && !additive && active < 0) { placeNote(e); return; }
         if (active < 0)
         { if (!additive) selected.clear(); mode = 3; grabKeyboardFocus(); repaint(); return; }
         const auto index = static_cast<size_t>(active);
         if (additive && selected.count(index)) { selected.erase(index); active = -1; repaint(); return; }
         if (!additive && !selected.count(index)) selected.clear(); selected.insert(index);
-        originals = value->notes;
+        originals = value->notes; sourceSelection = selected;
         mode = edge(active, e.position); owner.presenter.beginGesture(); gesture = true;
         auditionSelection(); grabKeyboardFocus(); repaint();
     }
     void mouseDoubleClick(const juce::MouseEvent& e) override
+    { if (!e.mods.isAltDown() && !owner.presenter.viewState().drawMode) placeNote(e); }
+    void placeNote(const juce::MouseEvent& e)
     {
         const auto* value = clip(); if (!value || e.x < owner.viewport.getViewPositionX() + keyWidth || !e.mods.isLeftButtonDown() || hit(e.position) >= 0) return;
         finish(false); value = clip(); if (!value) return;
-        if (value->notes.size() >= 512) { owner.presenter.message("MIDI clips support up to 512 notes."); return; }
+        if (value->notes.size() >= maxMidiNotes) { owner.presenter.message("MIDI clips support up to 4096 notes."); return; }
         const auto start = time(e.position.x);
         auto edited = *value; edited.notes.push_back({ juce::jlimit(0, 127, 127 - e.y / keyHeight()),
             start, step(), 0.8 });
@@ -239,7 +247,7 @@ public:
         auto delta = snapToGrid(point + (e.position.x - down.x) / zoom(), step(), true) - point;
         double minimum = -std::numeric_limits<double>::max(), maximum = std::numeric_limits<double>::max();
         int pitchMinimum = -127, pitchMaximum = 127;
-        for (const auto i : selected)
+        for (const auto i : sourceSelection)
         {
             const auto& note = originals[i]; const auto shortest = std::min(step(), note.duration);
             minimum = std::max(minimum, mode == 2 ? shortest - note.duration : -note.start);
@@ -248,16 +256,23 @@ public:
         }
         delta = juce::jlimit(minimum, maximum, delta);
         const auto pitchDelta = mode == 0 ? juce::jlimit(pitchMinimum, pitchMaximum, -juce::roundToInt((e.position.y - down.y) / keyHeight())) : 0;
-        if (std::abs(delta) < 1.0e-9 && pitchDelta == 0) return;
-        for (const auto i : selected)
-        { auto& note = edited.notes[i];
+        if (!dragged && std::abs(delta) < 1.0e-9 && pitchDelta == 0) return;
+        const bool duplicate = copying && mode == 0;
+        if (duplicate && originals.size() + sourceSelection.size() > maxMidiNotes)
+        { owner.presenter.message("MIDI clips support up to 4096 notes."); return; }
+        std::set<size_t> movedSelection; size_t movedActive = static_cast<size_t>(active);
+        for (const auto i : sourceSelection)
+        { if (duplicate) { if (i == static_cast<size_t>(active)) movedActive = edited.notes.size();
+              movedSelection.insert(edited.notes.size()); edited.notes.push_back(originals[i]); }
+          auto& note = edited.notes[duplicate ? edited.notes.size() - 1 : i];
           if (mode == 2) note.duration += delta;
           else { note.start += delta; if (mode == 1) note.duration -= delta; else note.pitch += pitchDelta; } }
         if (edited.notes == value->notes) return;
-        const auto previous = value->notes[static_cast<size_t>(active)]; dragged = true;
+        const auto previous = value->notes[dragged && duplicate ? movedActive : static_cast<size_t>(active)]; dragged = true;
         owner.presenter.changeClip(edited);
+        if (duplicate) selected = std::move(movedSelection);
         owner.refresh();
-        const auto& moved = edited.notes[static_cast<size_t>(active)];
+        const auto& moved = edited.notes[movedActive];
         if (moved.pitch != previous.pitch || !std::equal_to<double>()(moved.start, previous.start)) auditionSelection();
         repaint();
     }
@@ -266,6 +281,9 @@ public:
       const bool marquee = mode == 3; finish(false); if (marquee) auditionSelection(); mouseMove(e); }
     bool keyPressed(const juce::KeyPress& key) override
     {
+        if (key.getKeyCode() == '0' && !key.getModifiers().isAnyModifierKeyDown() && !selected.empty())
+        { if (const auto* value = clip()) { auto edited = *value; const auto enabled = !edited.notes[*selected.begin()].enabled;
+            for (const auto index : selected) edited.notes[index].enabled = enabled; owner.presenter.changeClip(edited); repaint(); } return true; }
         if (key.getKeyCode() == juce::KeyPress::escapeKey) { finish(true); return true; }
         if (key.getKeyCode() == juce::KeyPress::deleteKey || key.getKeyCode() == juce::KeyPress::backspaceKey) { removeSelected(); return true; }
         if (key.getModifiers().isCommandDown() && (key.getKeyCode() == 'a' || key.getKeyCode() == 'A')) { selectAll(); return true; }
@@ -298,17 +316,25 @@ private:
         owner.presenter.changeClip(edited); selected.clear(); repaint(); } }
     class Needle final : public juce::Component
     { public: void paint(juce::Graphics& graphics) override { graphics.fillAll(ink); } } needle;
-    MidiEditor& owner; std::vector<MidiNote> originals; std::set<size_t> selected, before;
+    MidiEditor& owner; std::vector<MidiNote> originals; std::set<size_t> selected, before, sourceSelection;
     juce::Point<float> down, last; int active = -1, mode = -1, mousePitch = -1;
     std::bitset<128> auditionPitches;
-    double auditionUntil = 0, insertTime = 0; bool gesture = false, dragged = false, additive = false;
+    double auditionUntil = 0, insertTime = 0; bool gesture = false, dragged = false, additive = false, copying = false;
 };
 class MidiEditor::Waveform final : public juce::Component, private juce::ChangeListener
 {
 public:
     explicit Waveform(MidiEditor& editor) : owner(editor), thumbnail(64, formats, cache)
-    { formats.registerBasicFormats(); thumbnail.addChangeListener(this); detail.addChangeListener(this); setTitle("Sample waveform; pinch or Ctrl/Command-scroll to zoom, drag to pan, double click to reset"); }
+    { addChildComponent(needle); needle.setInterceptsMouseClicks(false, false); formats.registerBasicFormats(); thumbnail.addChangeListener(this); detail.addChangeListener(this); setTitle("Sample waveform; pinch or Ctrl/Command-scroll to zoom, drag to pan, double click to reset"); }
     ~Waveform() override { sourceLoader.removeAllJobs(true, -1); detail.removeChangeListener(this); thumbnail.removeChangeListener(this); }
+    void updateNeedle()
+    {
+        const auto position = owner.presenter.samplerPosition(owner.trackId); const auto area = plot();
+        const auto* track = findTrack(owner.presenter.project(), owner.trackId);
+        const bool visible = isShowing() && position >= viewStart && position < viewStart + span() && track && position < track->sampleOffset + track->sampleDuration && span() > 0;
+        needle.setVisible(visible);
+        if (visible) needle.setBounds(juce::roundToInt(area.getX() + (position - viewStart) / span() * area.getWidth()), area.getY(), 1, area.getHeight());
+    }
     void refresh()
     {
         const auto* track = findTrack(owner.presenter.project(), owner.trackId);
@@ -367,17 +393,18 @@ public:
     void mouseDoubleClick(const juce::MouseEvent&) override { zoom = 1; viewStart = 0; dirty = true; repaint(); }
     void paint(juce::Graphics& graphics) override
     {
-        graphics.fillAll(juce::Colour(0xff181b20)); const auto area = plot();
+        graphics.fillAll(uiTone(UiTone::display)); const auto area = plot();
         const auto* track = findTrack(owner.presenter.project(), owner.trackId);
         const auto* asset = track ? findId(owner.presenter.project().assets, track->sample) : nullptr;
         const auto length = sourceLength();
         if (!track || !asset || asset->missing || length <= 0 || area.isEmpty() || sourceError.isNotEmpty())
         {
             graphics.setColour(juce::Colours::lightgrey); graphics.setFont(juce::FontOptions(12));
-            graphics.drawText(sourceError.isNotEmpty() ? sourceError : asset && asset->missing ? "Sample file is missing" : !asset ? "Drop audio file or clip" : "", getLocalBounds(), juce::Justification::centred);
+            const auto message = asset && asset->missing ? "Missing sample\n" + assetName(*asset) : sourceError.isNotEmpty() ? sourceError + (asset ? "\n" + assetName(*asset) : "") : !asset ? juce::String("Drop audio file or clip") : juce::String();
+            graphics.drawFittedText(message, getLocalBounds().reduced(8), juce::Justification::centred, 3);
             return;
         }
-        const auto colour = trackColour(owner.trackId).withMultipliedSaturation(1.2f);
+        const auto colour = primary;
         graphics.setColour(colour);
         if (!detail.draw(graphics, path, area.toFloat(), viewStart, viewStart + span(), asset->sampleRate, colour))
         { if (dirty) { envelope = waveformEnvelope(thumbnail, area.toFloat(), viewStart, viewStart + span()); dirty = false; }
@@ -404,6 +431,8 @@ public:
     }
 private:
     void changeListenerCallback(juce::ChangeBroadcaster*) override { dirty = true; repaint(); }
+    class Needle final : public juce::Component
+    { void paint(juce::Graphics& graphics) override { graphics.fillAll(juce::Colours::white.withAlpha(0.85f)); } } needle;
     MidiEditor& owner; juce::String path, sourceError; juce::ThreadPool sourceLoader {1}; juce::AudioFormatManager formats;
     WaveformDetail detail; juce::AudioThumbnailCache cache {4}; juce::AudioThumbnail thumbnail; juce::Path envelope;
     double zoom = 1, viewStart = 0, dragStart = 0; float downX = 0; bool dirty = true, panning = false;
@@ -412,7 +441,7 @@ class MidiEditor::DeviceSurface final : public juce::Component
 {
 public:
     void paint(juce::Graphics& graphics) override
-    { graphics.setColour(panel.darker(0.12f)); graphics.fillRoundedRectangle(getLocalBounds().toFloat(), 4);
+    { graphics.setColour(uiTone(UiTone::detail)); graphics.fillRoundedRectangle(getLocalBounds().toFloat(), 4);
       graphics.setColour(line); graphics.drawRoundedRectangle(getLocalBounds().toFloat().reduced(0.5f), 4, 1); }
 };
 class MidiEditor::DeviceHeader final : public juce::Component
@@ -425,10 +454,10 @@ public:
       enabled.onClick = [this] { owner.presenter.bypassSampler(owner.trackId, !enabled.getToggleState()); }; }
     void update()
     { if (const auto* track = findTrack(owner.presenter.project(), owner.trackId)) enabled.setToggleState(!track->samplerBypass, juce::dontSendNotification); }
-    void resized() override { enabled.setBounds(getWidth() - 22, 3, 17, 17); }
+    void resized() override { enabled.setBounds(getWidth() - 19, 2, 14, 14); }
     void paint(juce::Graphics& graphics) override
-    { graphics.fillAll(trackColour(owner.trackId).withMultipliedSaturation(0.5f)); graphics.setColour(trackColour(owner.trackId).contrasting());
-      graphics.setFont(juce::FontOptions(12)); graphics.drawText("Sampler", getLocalBounds().withTrimmedRight(26).reduced(8, 0), juce::Justification::centredLeft);
+    { graphics.fillAll(juce::Colour(0xff617f85)); graphics.setColour(juce::Colours::black);
+      graphics.setFont(juce::FontOptions(11)); graphics.drawText("Sampler", getLocalBounds().withTrimmedRight(26).reduced(8, 0), juce::Justification::centredLeft);
       graphics.drawRect(getLocalBounds(), hasKeyboardFocus(true) ? 2 : 1); }
     void mouseDown(const juce::MouseEvent& event) override
     {
@@ -462,26 +491,46 @@ public:
     }
     const Plugin* model() const
     { const auto* track = findTrack(owner.presenter.project(), owner.trackId); return track ? findId(track->plugins, id) : nullptr; }
+    int preferredWidth() const { return embedded ? editorWidth + 16 : 192; }
     void update()
-    { if (const auto* plugin = model()) enabled.setToggleState(!plugin->bypass, juce::dontSendNotification); repaint(); }
+    {
+        open.getProperties().set("midi-target", "plugin-device/" + id);
+        const auto slot = owner.presenter.plugins().editorSlot(id);
+        if (editingSlot != slot) { embedded.reset(); editingSlot = slot; }
+        if (!embedded && editingSlot && editingSlot->builtin && editingSlot->instance && editingSlot->instance->hasEditor() && !editingSlot->instance->getActiveEditor())
+        { embedded.reset(editingSlot->instance->createEditorAndMakeActive()); if (embedded) { editorWidth = embedded->getWidth(); addAndMakeVisible(*embedded); } }
+        if (embedded)
+        {
+            std::function<void(juce::Component&)> mark = [&](juce::Component& control)
+            { if (control.getProperties()["plugin-parameter"].isString()) control.getProperties().set("midi-target", "plugin/" + id + "/" + control.getProperties()["plugin-parameter"].toString());
+              for (int i = 0; i < control.getNumChildComponents(); ++i) mark(*control.getChildComponent(i)); };
+            mark(*embedded);
+        }
+        open.setVisible(!embedded);
+        const bool unavailable = editingSlot && !editingSlot->loading && (!editingSlot->instance || editingSlot->error.isNotEmpty());
+        open.setEnabled(editingSlot && editingSlot->instance && !unavailable); open.setButtonText(unavailable ? "Unavailable" : "Open");
+        if (unavailable) open.getProperties().remove("midi-target");
+        if (const auto* plugin = model()) enabled.setToggleState(!plugin->bypass, juce::dontSendNotification); resized(); repaint();
+    }
     void paint(juce::Graphics& graphics) override
     {
         const auto* plugin = model(); if (!plugin) return;
-        graphics.fillAll(panel); graphics.setColour(trackColour(owner.trackId)); graphics.fillRect(0, 0, getWidth(), 24);
-        graphics.setColour(trackColour(owner.trackId).contrasting()); graphics.setFont(juce::FontOptions(12));
-        graphics.drawText(plugin->name, 6, 0, getWidth() - 34, 24, juce::Justification::centredLeft, true);
+        const bool unavailable = editingSlot && !editingSlot->loading && (!editingSlot->instance || editingSlot->error.isNotEmpty());
+        graphics.fillAll(panel); graphics.setColour(unavailable ? juce::Colour(0xffb48179) : juce::Colour(0xff617f85)); graphics.fillRect(0, 0, getWidth(), 20);
+        graphics.setColour(juce::Colours::black); graphics.setFont(juce::FontOptions(11));
+        graphics.drawText((unavailable ? "Unavailable: " : "") + plugin->name, 6, 0, getWidth() - 34, 20, juce::Justification::centredLeft, true);
         graphics.setColour(ink); const auto message = owner.presenter.plugins().status(id);
-        graphics.drawFittedText(message.isEmpty() ? (plugin->instrument ? "Instrument" : "Audio effect") : message,
+        if (!embedded) graphics.drawFittedText(unavailable ? plugin->name + "\n" + message : message.isEmpty() ? (plugin->instrument ? "Instrument" : "Audio effect") : message,
                                8, 88, getWidth() - 16, getHeight() - 96, juce::Justification::topLeft, 3);
         graphics.setColour(hasKeyboardFocus(true) ? ink : line); graphics.drawRect(getLocalBounds(), hasKeyboardFocus(true) ? 2 : 1);
     }
     void resized() override
-    { enabled.setBounds(getWidth() - 22, 3, 18, 18); open.setBounds(8, 32, getWidth() - 16, 24); }
+    { enabled.setBounds(getWidth() - 19, 2, 14, 14); open.setBounds(8, 27, getWidth() - 16, 20); if (embedded) embedded->setBounds(8, 22, getWidth() - 16, std::max(1, getHeight() - 24)); }
     void mouseDown(const juce::MouseEvent& event) override
     {
         owner.presenter.selectTrack(owner.trackId); grabKeyboardFocus();
         if (event.mods.isPopupMenu())
-        { juce::PopupMenu menu; menu.addItem(1, "Open plug-in"); menu.addItem(2, "Delete");
+        { juce::PopupMenu menu; menu.addItem(1, "Open plug-in", editingSlot && editingSlot->instance != nullptr); menu.addItem(2, "Delete");
           juce::WeakReference<EditorPresenter> presenterRef(&owner.presenter); const auto track = owner.trackId, plugin = id;
           menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this), [presenterRef, track, plugin](int choice)
           { if (!presenterRef) return; if (choice == 1) presenterRef->plugins().showEditor(plugin); if (choice == 2) presenterRef->removePlugin(track, plugin); }); }
@@ -489,7 +538,7 @@ public:
     void mouseDoubleClick(const juce::MouseEvent&) override { owner.presenter.plugins().showEditor(id); }
     void mouseDrag(const juce::MouseEvent& event) override
     {
-        if (!event.mods.isLeftButtonDown() || event.getMouseDownY() >= 24 || event.getDistanceFromDragStart() < 4) return;
+        if (!event.mods.isLeftButtonDown() || event.getMouseDownY() >= 20 || event.getDistanceFromDragStart() < 4) return;
         if (auto* container = juce::DragAndDropContainer::findParentDragContainerFor(this))
             if (!container->isDragAndDropActive()) container->startDragging("plugin:" + owner.trackId + ":" + id, this, juce::ScaledImage(), true);
     }
@@ -499,6 +548,7 @@ public:
     juce::String id;
 private:
     MidiEditor& owner; juce::TextButton open {"Open plug-in"}, enabled {"On"};
+    std::shared_ptr<PluginHost::Slot> editingSlot; std::unique_ptr<juce::AudioProcessorEditor> embedded; int editorWidth = 192;
 };
 MidiEditor::MidiEditor(EditorPresenter& owner)
     : presenter(owner), roll(std::make_unique<Roll>(*this)), waveform(std::make_unique<Waveform>(*this)), deviceHeader(std::make_unique<DeviceHeader>(*this)), samplerSurface(std::make_unique<DeviceSurface>())
@@ -552,8 +602,9 @@ MidiEditor::MidiEditor(EditorPresenter& owner)
     volume.setRange(0, 2, 0.001); volume.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     volume.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 18);
     setSliderDefault(volume, 1);
-    volume.textFromValueFunction = [](double value) { return value <= 0 ? juce::String("-inf dB") : juce::String(20 * std::log10(value), 1) + " dB"; };
-    volume.valueFromTextFunction = [](const juce::String& text) { return text.containsIgnoreCase("inf") ? 0.0 : std::pow(10.0, text.getDoubleValue() / 20); }; volume.setTitle("Sampler volume; instrument output gain");
+    volume.textFromValueFunction = [](double value) { return volumeText(value); };
+    volume.valueFromTextFunction = [](const juce::String& text) { return (text.containsIgnoreCase("inf") || text.containsChar(0x221e)) ? 0.0 : std::pow(10.0, text.getDoubleValue() / 20); }; volume.setTitle("Sampler volume; instrument output gain");
+    volume.updateText();
     volume.onValueChange = [this] { presenter.setSamplerGain(trackId, volume.getValue()); };
     sampleStart.setTitle("Sampler sample start in seconds"); sampleEnd.setTitle("Sampler sample end in seconds");
     for (auto* slider : { &volume, &sampleStart, &sampleEnd })
@@ -576,7 +627,18 @@ MidiEditor::MidiEditor(EditorPresenter& owner)
     presenter.addChangeListener(this); refresh(); viewport.setViewPosition(0, (127 - 72) * presenter.viewState().pianoKeyHeight); startTimerHz(30);
 }
 MidiEditor::~MidiEditor() { deviceViewport.setViewedComponent(nullptr, false); deviceContent.removeMouseListener(this); stopTimer(); presenter.removeChangeListener(this); roll->finish(true); }
-void MidiEditor::paint(juce::Graphics& graphics) { graphics.fillAll(panel); }
+void MidiEditor::paint(juce::Graphics& graphics)
+{
+    graphics.fillAll(panel);
+    if (showPiano)
+    {
+        graphics.setColour(background); graphics.fillRoundedRectangle(4, 4, 148, static_cast<float>(getHeight() - 8), 3);
+        graphics.setColour(trackColour(presenter.project(), trackId)); graphics.fillRect(4, 4, 148, 20);
+        graphics.setColour(trackColour(presenter.project(), trackId).contrasting()); graphics.setFont(juce::FontOptions(11));
+        graphics.drawText("MIDI Clip", 10, 4, 134, 20, juce::Justification::centredLeft);
+        graphics.setColour(ink); graphics.drawText("Notes", 163, 2, 80, 22, juce::Justification::centredLeft);
+    }
+}
 void MidiEditor::mouseDown(const juce::MouseEvent& event)
 {
     if (showPiano || !event.mods.isPopupMenu()) return;
@@ -587,6 +649,29 @@ void MidiEditor::mouseDown(const juce::MouseEvent& event)
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMousePosition(), [safe](int choice)
     { if (safe && choice != 0 && safe->onAddDevice) safe->onAddDevice(*safe, choice == 1); });
 }
+void MidiEditor::paintDeviceOverview(juce::Graphics& g, juce::Rectangle<float> area) const
+{
+    const auto scale = area.getWidth() / static_cast<float>(std::max(1, deviceContent.getWidth()));
+    const auto draw = [&](const juce::Component& device)
+    {
+        auto box = area.withX(area.getX() + static_cast<float>(device.getX()) * scale).withWidth(static_cast<float>(device.getWidth()) * scale).reduced(1, 3);
+        if (box.isEmpty()) return;
+        g.setColour(background); g.fillRect(box); g.setColour(juce::Colour(0xff617f85)); g.fillRect(box.withHeight(2));
+        g.setColour(ink.withAlpha(0.4f)); g.drawRect(box);
+    };
+    if (samplerSurface->isVisible()) draw(*samplerSurface);
+    for (const auto& card : pluginCards) draw(*card);
+}
+void MidiEditor::scrollDevices(double proportion)
+{
+    const auto maximum = std::max(0, deviceContent.getWidth() - deviceViewport.getViewWidth());
+    deviceViewport.setViewPosition(juce::roundToInt(juce::jlimit(0.0, 1.0, proportion) * maximum), 0);
+}
+std::pair<double, double> MidiEditor::deviceViewRange() const
+{
+    const auto width = std::max(1, deviceContent.getWidth());
+    return { static_cast<double>(deviceViewport.getViewPositionX()) / width, std::min(1.0, static_cast<double>(deviceViewport.getViewWidth()) / width) };
+}
 void MidiEditor::cancelGesture() { roll->finish(true); }
 void MidiEditor::selectAllNotes() { roll->selectAll(); }
 void MidiEditor::copyNotes() { roll->copy(); }
@@ -595,7 +680,7 @@ void MidiEditor::duplicateNotes() { roll->duplicate(); }
 bool MidiEditor::noteFocused() const { return roll->hasKeyboardFocus(true); }
 void MidiEditor::setKeyboardNotes(std::bitset<128> notes) { keyboardNotes = notes; timerCallback(); }
 void MidiEditor::timerCallback()
-{ roll->updatePlayback();
+{ roll->updatePlayback(); waveform->updateNeedle();
   const auto pressed = presenter.activeNotes(trackId) | keyboardNotes | roll->pressed();
   if (pressed != activeNotes) { activeNotes = pressed; roll->repaint(); } }
 void MidiEditor::setContext(juce::String track, juce::String clip, bool piano)
@@ -604,6 +689,8 @@ void MidiEditor::setContext(juce::String track, juce::String clip, bool piano)
     if (trackId != track || clipId != clip || (showPiano && !piano)) roll->finish(true);
     if (trackId != track || clipId != clip) roll->clearSelection();
     trackId = std::move(track); clipId = std::move(clip); showPiano = piano;
+    volume.getProperties().set("midi-target", "track/" + trackId + "/sampler-volume");
+    root.getProperties().set("midi-target", "track/" + trackId + "/sampler-root");
     resized(); refresh();
     if (changed) if (const auto* value = findId(presenter.project().clips, clipId))
     { roll->setInsertion(midiSourceTime(*value)); viewport.setViewPosition(static_cast<int>(std::min(10000000.0, midiSourceTime(*value) * presenter.viewState().pianoZoom)), viewport.getViewPositionY()); }
@@ -619,14 +706,14 @@ bool MidiEditor::keyPressed(const juce::KeyPress& key)
 }
 void MidiEditor::resized()
 {
-    auto bounds = getLocalBounds(); auto bar = bounds.removeFromTop(28).reduced(6, 3);
-    auto zoomControls = bar.removeFromRight(180);
+    auto bounds = getLocalBounds().reduced(4); auto inspector = bounds.removeFromLeft(148).reduced(6, 0); bounds.removeFromLeft(6);
+    inspector.removeFromTop(27); loopToggle.setBounds(inspector.removeFromTop(19)); inspector.removeFromTop(8);
+    for (auto pair : { std::pair<juce::Label*, juce::Slider*> { &loopStartLabel, &loopStart }, { &loopLengthLabel, &loopLength }, { &clipLengthLabel, &clipLength } })
+    { pair.first->setBounds(inspector.removeFromTop(15)); pair.second->setBounds(inspector.removeFromTop(20)); inspector.removeFromTop(6); }
+    auto bar = bounds.removeFromTop(22); auto zoomControls = bar.removeFromRight(180);
     horizontalLabel.setBounds(zoomControls.removeFromLeft(15)); horizontalZoom.setBounds(zoomControls.removeFromLeft(65)); zoomControls.removeFromLeft(10);
     verticalLabel.setBounds(zoomControls.removeFromLeft(15)); verticalZoom.setBounds(zoomControls);
-    loopToggle.setBounds(bar.removeFromLeft(64));
-    for (auto pair : { std::pair<juce::Label*, juce::Slider*> { &loopStartLabel, &loopStart }, { &loopLengthLabel, &loopLength }, { &clipLengthLabel, &clipLength } })
-    { pair.first->setBounds(bar.removeFromLeft(78)); pair.second->setBounds(bar.removeFromLeft(94)); bar.removeFromLeft(8); }
-    viewport.setBounds(bounds); deviceViewport.setBounds(getLocalBounds().reduced(8)); refresh();
+    viewport.setBounds(bounds); deviceViewport.setBounds(getLocalBounds().reduced(4)); refresh();
 }
 void MidiEditor::refresh()
 {
@@ -641,29 +728,36 @@ void MidiEditor::refresh()
     { pluginCards.clear(); if (track) for (const auto& plugin : track->plugins)
       { auto card = std::make_unique<PluginCard>(*this, plugin.id); deviceContent.addAndMakeVisible(*card); pluginCards.push_back(std::move(card)); } }
     samplerSurface->setVisible(installed);
-    const int samplerWidth = installed ? 708 : 0, cardWidth = 192;
-    const int chainWidth = samplerWidth + static_cast<int>(pluginCards.size()) * (cardWidth + 8);
+    const int samplerWidth = installed ? juce::jlimit(568, 848, juce::roundToInt(deviceViewport.getMaximumVisibleWidth() * 0.48)) : 0;
+    int chainWidth = samplerWidth; for (auto& card : pluginCards) { card->update(); chainWidth += card->preferredWidth() + 8; }
     const auto availableWidth = deviceViewport.getMaximumVisibleWidth();
-    deviceContent.setSize(chainWidth > availableWidth ? chainWidth + 180 : availableWidth, std::max(140, deviceViewport.getMaximumVisibleHeight()));
-    for (size_t i = 0; i < pluginCards.size(); ++i)
-    { pluginCards[i]->setBounds(samplerWidth + static_cast<int>(i) * (cardWidth + 8), 0, cardWidth, deviceContent.getHeight()); pluginCards[i]->update(); }
+    deviceContent.setSize(chainWidth > availableWidth ? chainWidth + 180 : availableWidth, std::max(140, std::min(instrumentHeight - 16, deviceViewport.getMaximumVisibleHeight())));
+    int deviceX = samplerWidth;
+    for (auto& card : pluginCards) { card->setBounds(deviceX, 0, card->preferredWidth(), deviceContent.getHeight()); deviceX += card->preferredWidth() + 8; }
     dropEffects.setBounds(chainWidth, 0, std::max(0, deviceContent.getWidth() - chainWidth), deviceContent.getHeight());
     label(dropEffects, track && track->midi && !installed && (track->plugins.empty() || !track->plugins.front().instrument)
         ? "Drop Instrument or Audio Effects Here" : "Drop Audio Effects Here");
     samplerSurface->setBounds(0, 0, samplerWidth > 0 ? samplerWidth - 8 : 0, deviceContent.getHeight());
     auto instrument = samplerSurface->getLocalBounds().reduced(6);
-    deviceHeader->setBounds(instrument.removeFromTop(23)); instrument.removeFromTop(3);
-    auto bar = instrument.removeFromTop(21);
+    deviceHeader->setBounds(instrument.removeFromTop(18)); instrument.removeFromTop(3);
+    auto bar = instrument.removeFromTop(18);
     load.setBounds(bar.removeFromRight(48)); bar.removeFromRight(4); clips.setBounds(bar.removeFromRight(64)); source.setBounds(bar);
-    auto controls = instrument.removeFromBottom(48); instrument.removeFromBottom(5);
+    auto controls = instrument.removeFromBottom(42); instrument.removeFromBottom(4);
     waveform->setBounds(instrument);
     const int column = controls.getWidth() / 4;
     for (auto pair : { std::pair<juce::Label*, juce::Slider*> { &rootLabel, &root }, { &volumeLabel, &volume }, { &startLabel, &sampleStart }, { &endLabel, &sampleEnd } })
-    { auto cell = controls.removeFromLeft(column).reduced(5, 0); pair.first->setBounds(cell.removeFromTop(15)); pair.second->setBounds(cell); }
-    label(source, asset ? assetName(*asset) : "");
+    { auto cell = controls.removeFromLeft(column).reduced(5, 0); pair.first->setBounds(cell.removeFromTop(13)); pair.second->setBounds(cell); }
+    label(source, asset ? (asset->missing ? "Missing: " : "") + assetName(*asset) : "");
+    source.setTooltip(asset ? asset->path : juce::String()); if (asset && asset->missing) source.setColour(juce::Label::textColourId, uiTone(UiTone::record));
     if (track) { root.setValue(track->rootNote, juce::dontSendNotification); volume.setValue(track->samplerGain, juce::dontSendNotification); }
     const bool readable = track && asset && !asset->missing;
     sampleStart.setEnabled(readable); sampleEnd.setEnabled(readable);
+    if (track && !readable)
+    {
+        const auto maximum = std::max(1.0, track->sampleOffset + track->sampleDuration);
+        sampleStart.setRange(0, maximum); sampleEnd.setRange(0, maximum);
+        sampleStart.setValue(track->sampleOffset, juce::dontSendNotification); sampleEnd.setValue(track->sampleOffset + track->sampleDuration, juce::dontSendNotification);
+    }
     if (readable)
     {
         const auto frame = 1 / asset->sampleRate, length = static_cast<double>(asset->length) / asset->sampleRate;

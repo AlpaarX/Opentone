@@ -5,10 +5,11 @@ namespace opentone
 {
 inline std::optional<Clip> clipInTimeSelection(Clip clip, const TimeSelection& selection)
 {
-    if (!selection.tracks.contains(clip.track)) return {};
+    if (clip.scene >= 0 || !selection.tracks.contains(clip.track)) return {};
     const auto from = std::max(clip.start, selection.start), to = std::min(clip.start + clip.duration, selection.end);
     if (to <= from) return {};
-    clip.offset += from - clip.start; clip.start = from; clip.duration = to - from;
+    clip.offset += (from - clip.start) * clip.playbackRate; clip.start = from; clip.duration = to - from;
+    clip.fadeIn = std::min(clip.fadeIn, clip.duration); clip.fadeOut = std::min(clip.fadeOut, clip.duration);
     return clip;
 }
 inline double timelineGridStep(double bpm, double pixelsPerSecond)
@@ -41,7 +42,7 @@ struct MidiPattern
 };
 inline std::optional<MidiPattern> midiPattern(const Clip& clip, const MidiNote& note)
 {
-    if (note.velocity <= 0) return {};
+    if (!clip.enabled || !note.enabled || note.probability <= 0 || (note.velocity <= 0 && note.velocityDeviation <= 0)) return {};
     if (clip.loop && clip.loopLength > 0)
     {
         if (note.start < clip.loopStart || note.start >= clip.loopStart + clip.loopLength) return {};
@@ -72,10 +73,12 @@ inline Clip trimLeft(Clip clip, double start)
         const auto delta = juce::jlimit(-clip.start, clip.duration - 1.0e-6, start - clip.start);
         clip.offset = midiSourceTime(clip, delta); clip.start += delta; clip.duration -= delta; return clip;
     }
-    const auto delta = juce::jlimit(-clip.offset, clip.duration - 1.0e-6, start - clip.start);
+    const auto delta = juce::jlimit(-clip.offset / clip.playbackRate, clip.duration - 1.0e-6, start - clip.start);
     const auto allowed = std::max(-clip.start, delta);
-    clip.start += allowed; clip.offset += allowed; clip.duration -= allowed; return clip;
+    clip.start += allowed; clip.offset += allowed * clip.playbackRate; clip.duration -= allowed;
+    clip.fadeIn = std::min(clip.fadeIn, clip.duration); clip.fadeOut = std::min(clip.fadeOut, clip.duration); return clip;
 }
 inline Clip trimRight(Clip clip, double end, double sourceDuration)
-{ clip.duration = juce::jlimit(1.0e-6, sourceDuration - clip.offset, end - clip.start); return clip; }
+{ clip.duration = juce::jlimit(1.0e-6, (sourceDuration - clip.offset) / clip.playbackRate, end - clip.start);
+  clip.fadeIn = std::min(clip.fadeIn, clip.duration); clip.fadeOut = std::min(clip.fadeOut, clip.duration); return clip; }
 }

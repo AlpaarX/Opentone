@@ -22,7 +22,7 @@ public:
         setUsingNativeTitleBar(true);
 #endif
         setContentOwned(api.create(presenter), true);
-        setResizable(true, false); setResizeLimits(900, 540, 4000, 2400);
+        setResizable(true, false); setResizeLimits(640, 540, 4000, 2400);
         centreWithSize(getWidth(), getHeight()); setVisible(true);
     }
     void closeButtonPressed() override { juce::JUCEApplication::getInstance()->systemRequestedQuit(); }
@@ -186,13 +186,12 @@ private:
         if (!next || next == ui || !replaceEditor(next)) return false;
         engine->render(buffer.getArrayOfWritePointers(), 2, 256);
         if (presenter->viewState().selectedClips != viewBefore.selectedClips || presenter->viewState().snap != viewBefore.snap
-            || presenter->viewState().trackHeights != viewBefore.trackHeights
             || presenter->viewState().scrollX != viewBefore.scrollX
             || std::abs(presenter->viewState().pixelsPerSecond - viewBefore.pixelsPerSecond) > 1.0e-9) return false;
         if (!(session->project() == before.project) || session->snapshot().revision != before.revision
             || !session->dirty() || !engine->playing() || engine->position() <= cursor || buffer.getMagnitude(0, 256) <= 0
             || std::abs(engine->master() - 0.5f) > 1.0e-6f) return false;
-        session->undoEdit(); session->undoEdit(); session->undoEdit();
+        session->undoEdit(); session->undoEdit(); session->undoEdit(); session->undoEdit();
         if (!(session->project() == reloadInitialProject)) return false;
         session->redoEdit(); session->redoEdit(); session->redoEdit();
         if (!(session->project() == before.project)) return false;

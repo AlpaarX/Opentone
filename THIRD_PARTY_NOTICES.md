@@ -10,6 +10,13 @@ The upstream notice is reproduced in licenses/JUCE.md. Its relative links refer 
 that JUCE source tree. The complete license texts of bundled dependencies are
 reproduced in licenses/ and accompany evaluation builds.
 
+Ableton Link 3.1.5 (revision 45931b8bd2a7066f1950f2a0beab81a0c51f28fe), Copyright
+(c) Ableton AG, is used under its GPLv2-or-later license. Source:
+https://github.com/Ableton/link/tree/45931b8bd2a7066f1950f2a0beab81a0c51f28fe.
+Its notices are in licenses/Ableton-Link.md and licenses/Ableton-Link-GPL-2.txt.
+Link's standalone Asio dependency, Copyright (c) Christopher M. Kohlhoff, uses
+the Boost Software License 1.0 (licenses/Asio-Standalone.txt).
+
 Selected JUCE modules include code from:
 
 - FLAC: Xiph.Org Foundation and contributors, BSD license (licenses/FLAC.txt).

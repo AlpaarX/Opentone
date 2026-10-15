@@ -11,11 +11,21 @@ FetchContent_Declare(JUCE
     URL https://github.com/juce-framework/JUCE/archive/91ad83ae34a81e0833b1a2b0866f54846370ae53.tar.gz
     URL_HASH SHA256=04f8d5055382582c757be9da069ea98338005f98248facd9c2804435ac853e70)
 FetchContent_MakeAvailable(JUCE)
+# Use the header-only Link target without building the SDK examples.
+FetchContent_Declare(ableton_link
+    GIT_REPOSITORY https://github.com/Ableton/link.git
+    GIT_TAG 45931b8bd2a7066f1950f2a0beab81a0c51f28fe
+    GIT_SHALLOW TRUE GIT_SUBMODULES modules/asio-standalone
+    SOURCE_SUBDIR headers-only)
+FetchContent_MakeAvailable(ableton_link)
+include(${ableton_link_SOURCE_DIR}/AbletonLinkConfig.cmake)
+
 
 juce_add_gui_app(Opentone
     PRODUCT_NAME "Opentone"
     COMPANY_NAME "Opentone"
     BUNDLE_ID "org.opentone.desktop"
+    PLIST_TO_MERGE "<plist><dict><key>NSLocalNetworkUsageDescription</key><string>Opentone uses Ableton Link to synchronize tempo with music apps on your local network.</string></dict></plist>"
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "Opentone records microphone audio into armed audio tracks."
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/assets/opentone.png"
@@ -25,13 +35,13 @@ option(OPENTONE_LIVE_UI "Build the development host and reloadable C++ UI" OFF)
 set(opentone_juce_modules
     juce_gui_basics juce_audio_devices juce_audio_formats juce_audio_basics
     juce_data_structures juce_audio_utils juce_gui_extra juce_graphics juce_events
-    juce_core juce_audio_processors juce_audio_processors_headless)
+    juce_core juce_audio_processors juce_audio_processors_headless juce_dsp)
 if(NOT APPLE)
     add_compile_definitions(JUCE_USE_MP3AUDIOFORMAT=1)
 endif()
 if(OPENTONE_LIVE_UI)
     # One JUCE runtime ensures host and UI share devices, message manager and allocators.
-    add_library(OpentoneRuntime SHARED src/infrastructure/Storage.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp)
+    add_library(OpentoneRuntime SHARED src/infrastructure/Storage.cpp src/infrastructure/AbletonImport.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/infrastructure/BuiltinPlugins.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp)
     target_include_directories(OpentoneRuntime PUBLIC "${juce_SOURCE_DIR}/modules" src)
     target_compile_features(OpentoneRuntime PUBLIC cxx_std_17)
     target_compile_definitions(OpentoneRuntime PUBLIC
@@ -44,6 +54,7 @@ if(OPENTONE_LIVE_UI)
         target_link_libraries(OpentoneRuntime PRIVATE juce::${module})
         target_compile_definitions(OpentoneRuntime INTERFACE JUCE_MODULE_AVAILABLE_${module}=1)
     endforeach()
+    target_link_libraries(OpentoneRuntime PRIVATE Ableton::Link)
     target_link_libraries(OpentoneRuntime PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     if(WIN32)
         set(opentone_live_dir "${CMAKE_BINARY_DIR}/Opentone_artefacts/${CMAKE_BUILD_TYPE}")
@@ -62,7 +73,8 @@ if(OPENTONE_LIVE_UI)
     target_compile_definitions(Opentone PRIVATE OPENTONE_LIVE_UI=1 OPENTONE_UI_MODULE_PATH="$<TARGET_FILE:OpentoneUI>")
     add_dependencies(Opentone OpentoneUI)
 else()
-    target_sources(Opentone PRIVATE src/app/Main.cpp src/infrastructure/Storage.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp src/ui/Editor.cpp src/ui/Browser.cpp src/ui/Transport.cpp src/ui/Timeline.cpp src/ui/Mixer.cpp src/ui/MidiEditor.cpp src/ui/UiTheme.cpp src/ui/UiModule.cpp)
+    target_sources(Opentone PRIVATE src/app/Main.cpp src/infrastructure/Storage.cpp src/infrastructure/AbletonImport.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/infrastructure/BuiltinPlugins.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp src/ui/Editor.cpp src/ui/Browser.cpp src/ui/Transport.cpp src/ui/Timeline.cpp src/ui/Mixer.cpp src/ui/MidiEditor.cpp src/ui/UiTheme.cpp src/ui/UiModule.cpp)
+    target_link_libraries(Opentone PRIVATE Ableton::Link)
     target_compile_features(Opentone PRIVATE cxx_std_17)
     target_compile_definitions(Opentone PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     foreach(module IN LISTS opentone_juce_modules)
@@ -115,11 +127,11 @@ if(BUILD_TESTING)
         endif()
     endif()
     juce_add_console_app(OpentoneChecks PRODUCT_NAME "Opentone checks")
-    target_sources(OpentoneChecks PRIVATE tests/core/Checks.cpp src/infrastructure/Storage.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp)
+    target_sources(OpentoneChecks PRIVATE tests/core/Checks.cpp src/infrastructure/Storage.cpp src/infrastructure/AbletonImport.cpp src/infrastructure/AudioEngine.cpp src/infrastructure/PluginHost.cpp src/infrastructure/BuiltinPlugins.cpp src/domain/ProjectSession.cpp src/application/EditorPresenter.cpp)
     target_include_directories(OpentoneChecks PRIVATE src)
     target_compile_features(OpentoneChecks PRIVATE cxx_std_17)
     target_compile_definitions(OpentoneChecks PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1 OPENTONE_TESTING=1)
-    target_link_libraries(OpentoneChecks PRIVATE juce::juce_audio_utils juce::juce_audio_devices juce::juce_audio_formats
+    target_link_libraries(OpentoneChecks PRIVATE Ableton::Link juce::juce_dsp juce::juce_audio_utils juce::juce_audio_devices juce::juce_audio_formats
         juce::juce_data_structures juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     add_test(NAME focused COMMAND OpentoneChecks)
     add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS OpentoneChecks)

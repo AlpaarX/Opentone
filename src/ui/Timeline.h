@@ -11,6 +11,8 @@ public:
     ~Timeline() override;
     void resized() override;
     void paint(juce::Graphics&) override;
+    void mouseDown(const juce::MouseEvent&) override;
+    void mouseDrag(const juce::MouseEvent&) override;
     void refresh();
     void tick();
     void deleteSelection();
@@ -23,19 +25,30 @@ private:
     class Canvas;
     class Headers;
     class Master;
+    class Returns;
     class LoopBrace;
+    class TimeRuler;
+    class BeatRuler;
     class Scroll : public juce::Viewport
     { public: std::function<void(juce::Rectangle<int>)> onScroll;
+      juce::Viewport* wheelTarget = nullptr;
+      void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
+      { if (wheelTarget) wheelTarget->mouseWheelMove(event.getEventRelativeTo(wheelTarget), wheel);
+        else juce::Viewport::mouseWheelMove(event, wheel); }
       void visibleAreaChanged(const juce::Rectangle<int>& bounds) override { if (onScroll) onScroll(bounds); } };
     EditorPresenter& presenter;
     juce::ToggleButton snap { "Snap" };
     juce::Slider zoom;
     Scroll lanes;
-    juce::Viewport headers;
+    Scroll headers;
     std::unique_ptr<Canvas> canvas;
     std::unique_ptr<Headers> trackHeaders;
     std::unique_ptr<Master> master;
+    std::unique_ptr<Returns> returns;
     std::unique_ptr<LoopBrace> loopBrace;
-    bool restoring = true;
+    std::unique_ptr<TimeRuler> timeRuler;
+    std::unique_ptr<BeatRuler> beatRuler;
+    juce::TextButton automationButton {"Automation"}, automationLock {"Lock"}, setLocator {"Set"}, previousLocator {"Previous"}, nextLocator {"Next"};
+    bool restoring = true; int fixedBraceHeight = 18;
 };
 }

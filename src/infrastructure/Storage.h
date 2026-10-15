@@ -14,6 +14,9 @@ class OPENTONE_API Storage
 public:
     Storage();
     ~Storage();
+    const juce::StringArray& recentProjects() const { return recent; }
+    juce::Result rememberProject(const juce::File&);
+    juce::Result cleanRecentProjects(bool clear);
     const juce::StringArray& sampleFolders() const { return folders; }
     juce::Result addSampleFolder(const juce::File&);
     juce::Result removeSampleFolder(const juce::File&);
@@ -31,7 +34,8 @@ private:
     void run(std::function<void()> work);
     juce::File temporary;
     std::unique_ptr<juce::PropertiesFile> libraryPreferences;
-    juce::StringArray folders;
+    juce::StringArray folders, recent;
+    juce::Result saveRecentProjects();
     juce::Result saveFolders();
     std::shared_ptr<std::atomic<uint64_t>> epoch = std::make_shared<std::atomic<uint64_t>>(0);
     juce::ThreadPool pool { 1 };
