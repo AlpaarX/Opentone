@@ -106,7 +106,7 @@ private:
         std::atomic<juce::int64> position { 0 };
         std::unique_ptr<Voice> voice;
         std::shared_ptr<Control> control;
-        juce::String track; int note = 0; bool held = false;
+        juce::String track; int note = 0; bool held = false, oneShot = false;
         int releaseLeft = 0; float level = 0;
     };
     struct PreviewRequest { size_t slot; Track track; Asset asset; juce::File file; int note; double velocity; bool held; std::shared_ptr<Control> control; };

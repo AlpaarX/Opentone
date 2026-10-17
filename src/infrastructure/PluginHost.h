@@ -24,7 +24,7 @@ public:
     struct Bus
     {
         struct Preview { bool on = false, held = false; juce::int64 end = 0; float velocity = 0.8f; };
-        juce::AudioBuffer<float> audio, feedback;
+        juce::AudioBuffer<float> audio, feedback, postFx;
         juce::MidiBuffer midi, queued;
         std::vector<std::shared_ptr<Slot>> slots;
         std::array<Preview, 128> previews {};

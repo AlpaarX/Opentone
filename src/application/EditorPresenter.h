@@ -113,7 +113,10 @@ public:
     bool isBrowserDrag(const juce::String& text) const { return text.startsWith("device:") || text.startsWith("sample:"); }
     void dropBrowserItem(const juce::String& text, const juce::String& track, double start = 0)
     { if (text.startsWith("device:")) addDevice(text.substring(7), track); else if (text.startsWith("sample:")) importFiles({text.substring(7)}, track, start); }
+    void previewLibraryItem(const juce::String& description);
+    void stopLibraryPreview();
     void loadSampler(const juce::String& track, const juce::String& asset, double offset, double duration);
+    void loadSamplerPreset(const juce::String& track, int index);
     void setRootNote(const juce::String& track, int note) { session.setRootNote(track, note); }
     void addSampler(const juce::String& track) { session.addSampler(track); }
     void bypassSampler(const juce::String& id, bool bypass)
@@ -121,6 +124,8 @@ public:
     void removeSampler(const juce::String& track);
     void moveSampler(const juce::String& source, const juce::String& destination);
     void setSamplerGain(const juce::String& track, double gain) { session.setSamplerGain(track, gain); }
+    void setSamplerMode(const juce::String& track, bool oneShot, bool loop)
+    { engine.releasePreview(track, -1); session.setSamplerMode(track, oneShot, loop); }
     void copyMidiNotes(std::vector<MidiNote> notes) { midiClipboard = std::move(notes); }
     const std::vector<MidiNote>& midiNotesClipboard() const { return midiClipboard; }
     bool previewNote(const juce::String& track, int note, double velocity = 0.8, bool held = false);
@@ -214,6 +219,12 @@ public:
     void importFiles(const juce::StringArray&, juce::String track, double start, bool browserOnly = false);
     void requestQuit(void (*done)());
 private:
+    std::shared_ptr<std::atomic<uint64_t>> libraryPreviewEpoch = std::make_shared<std::atomic<uint64_t>>(0);
+    juce::ThreadPool libraryPreviewPool {1};
+    juce::TimeSliceThread libraryReadAhead {"Library preview"};
+    std::shared_ptr<juce::PositionableAudioSource> librarySource;
+    juce::AudioTransportSource libraryTransport;
+    juce::AudioSourcePlayer libraryPlayer;
     std::vector<AutomationPoint> automationClipboard; int automationClipboardParameter = 0;
     std::vector<MidiNote> midiClipboard;
     std::optional<Track> trackClipboard; std::vector<Clip> trackClips; std::vector<Track> trackChildren;

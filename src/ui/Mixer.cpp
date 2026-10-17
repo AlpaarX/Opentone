@@ -8,7 +8,7 @@ namespace { constexpr int stripWidth = 104; }
 class Mixer::Strip final : public juce::Component, public juce::DragAndDropTarget
 {
 public:
-    Strip(Mixer& mixer, juce::String trackId) : id(std::move(trackId)), owner(mixer)
+    Strip(Mixer& mixer, juce::String trackId) : id(std::move(trackId)), owner(mixer), gain(mixer.presenter, id)
     {
         setWantsKeyboardFocus(true);
         for (auto* child : std::initializer_list<juce::Component*> { &name, &kind, &fold, &gain, &pan, &sendA, &sendB, &mute, &solo, &arm, &meter }) addAndMakeVisible(child);
@@ -27,9 +27,6 @@ public:
         gain.updateText();
         gain.onDragStart = [this] { owner.presenter.selectTrack(id); owner.presenter.beginGesture(); };
         gain.onDragEnd = [this] { owner.presenter.endGesture(false); };
-        gain.onValueChange = [this]
-        { if (isMaster()) owner.presenter.setMaster(static_cast<float>(gain.getValue()));
-          else if (const auto* track = findTrack(owner.presenter.project(), id)) owner.presenter.controls(id, gain.getValue(), track->mute); };
         configurePanSlider(pan); pan.onValueChange = [this] { owner.presenter.setPan(id, pan.getValue()); };
         pan.onDragStart = [this] { owner.presenter.selectTrack(id); owner.presenter.beginGesture(); }; pan.onDragEnd = [this] { owner.presenter.endGesture(false); };
         sendA.bind(owner.presenter, id, 0, 16); sendB.bind(owner.presenter, id, 1, 16);
@@ -66,7 +63,7 @@ public:
     void tick() { if (const auto* track = findTrack(owner.presenter.project(), id))
       { sendA.refresh(); sendB.refresh(); }
       meter.setLevels(isMaster() ? owner.presenter.masterLevels() : owner.presenter.trackLevels(id));
-      if (!gain.isMouseButtonDown()) gain.setValue(owner.presenter.trackValue(id, false), juce::dontSendNotification);
+      if (!gain.isMouseButtonDown(true)) gain.setValue(owner.presenter.trackValue(id, false), juce::dontSendNotification);
       if (!pan.isMouseButtonDown()) pan.setValue(owner.presenter.trackValue(id, true), juce::dontSendNotification); }
     void paint(juce::Graphics& graphics) override
     {
@@ -113,7 +110,7 @@ public:
 private:
     LevelMeter meter;
     Mixer& owner;
-    juce::Label name, kind; juce::Slider gain, pan; SendSlider sendA, sendB;
+    juce::Label name, kind; TrackVolumeSlider gain; juce::Slider pan; SendSlider sendA, sendB;
     juce::TextButton mute {"M"}, solo {"S"}, arm {"Record"}, fold {"Fold"};
 };
 class Mixer::Channels final : public juce::Component

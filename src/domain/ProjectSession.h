@@ -32,13 +32,14 @@ public:
     bool armTrack(const juce::String&, bool);
     bool trackLayout(const juce::String&, int height, bool folded);
     bool loadSampler(const juce::String& track, const juce::String& asset, double offset, double duration,
-                     std::optional<Asset> imported = {});
+                     std::optional<Asset> imported = {}, int presetRoot = -1);
     bool setRootNote(const juce::String& track, int note);
     bool addSampler(const juce::String& track, bool createTrack = false);
     bool removeSampler(const juce::String& track);
     bool moveSampler(const juce::String& source, const juce::String& destination);
     bool bypassSampler(const juce::String&, bool);
     bool setSamplerGain(const juce::String& track, double gain);
+    bool setSamplerMode(const juce::String& track, bool oneShot, bool loop);
     bool renameTrack(const juce::String& id, const juce::String& name);
     bool deleteTrack(const juce::String& id);
     bool addPlugin(const juce::String&, Plugin, bool createTrack = false);

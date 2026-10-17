@@ -445,7 +445,7 @@ void Editor::releaseKeyboard(bool all)
 void Editor::showDevicesMenu(const juce::String& trackId, juce::Component& anchor, bool instrument)
 {
     const auto track = trackId; const auto* model = findTrack(presenter.project(), track); if (!model) return;
-    if (instrument && (!model->midi || model->sampler || (!model->plugins.empty() && model->plugins.front().instrument)))
+    if (instrument && (!model->midi || model->sampler || std::any_of(model->plugins.begin(), model->plugins.end(), [](const auto& plugin) { return plugin.instrument; })))
     { presenter.message("Remove the current instrument before adding another."); return; }
     presenter.selectTrack(track); refreshPanels();
     const auto types = presenter.plugins().availablePlugins();
@@ -691,6 +691,16 @@ void Editor::confirmOverwrite(const juce::File&, std::function<void(bool)> reply
 }
 namespace
 {
+class GeneralSettings final : public juce::Component
+{
+public:
+    explicit GeneralSettings(EditorPresenter&)
+    { addAndMakeVisible(description); label(description, "Opentone starts with a blank project. File > New creates another blank project."); }
+    void resized() override
+    { description.setBounds(getLocalBounds().reduced(16).removeFromTop(44)); }
+private:
+    juce::Label description;
+};
 class Appearance final : public juce::Component, private juce::ChangeListener
 {
 public:
@@ -746,10 +756,11 @@ void Editor::showDevices(bool plugins, bool audio)
     if (pendingDialogs != 0) return;
     ++pendingDialogs; juce::Component::SafePointer<Editor> safe(this);
     auto tabs = std::make_unique<juce::TabbedComponent>(juce::TabbedButtonBar::TabsAtTop);
+    tabs->addTab("General", panel, new GeneralSettings(presenter), true);
     tabs->addTab("Appearance", panel, new Appearance([safe] { if (safe) safe->applyColours(); }), true);
     tabs->addTab("Audio", panel, new juce::AudioDeviceSelectorComponent(presenter.devices(), 0, 2, 2, 2, true, false, true, false), true);
     tabs->addTab("Plug-ins", panel, presenter.plugins().scanner().release(), true);
-    if (plugins) tabs->setCurrentTabIndex(2); else if (audio) tabs->setCurrentTabIndex(1);
+    if (plugins) tabs->setCurrentTabIndex(3); else if (audio) tabs->setCurrentTabIndex(2);
     tabs->setSize(680, 480); juce::DialogWindow::LaunchOptions options;
     options.content.setOwned(tabs.release()); options.dialogTitle = "Settings";
     options.dialogBackgroundColour = panel; options.escapeKeyTriggersCloseButton = true;

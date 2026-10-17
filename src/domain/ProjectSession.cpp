@@ -117,6 +117,7 @@ bool ProjectSession::ungroup(const juce::String& id)
     const auto* original = findId(state.tracks, id); if (!original || !original->group) return false;
     auto next = state; for (auto& track : next.tracks) if (track.parentGroup == id) track.parentGroup = original->parentGroup;
     for (auto& track : next.tracks) if (track.outputTrack == id) track.outputTrack = outputDestination(*original).isEmpty() ? "master" : outputDestination(*original);
+    for (auto* track : allTracks(next)) for (auto& plugin : track->plugins) if (plugin.sidechain == id) plugin.sidechain.clear();
     erase(next.tracks, [&](const auto& track) { return track.id == id; }); orderTracks(next); return edit(std::move(next), "Ungroup tracks");
 }
 bool ProjectSession::moveTracks(const juce::StringArray& ids, const juce::String& group)
@@ -143,13 +144,14 @@ bool ProjectSession::trackLayout(const juce::String& id, int height, bool folded
 { auto next = state; auto* track = findTrack(next, id); if (!track) return false;
   track->height = height; track->folded = folded; return edit(std::move(next), "Track layout", false); }
 bool ProjectSession::loadSampler(const juce::String& id, const juce::String& asset, double offset, double duration,
-                               std::optional<Asset> imported)
+                               std::optional<Asset> imported, int presetRoot)
 {
     auto next = state;
     if (asset.isEmpty()) return false;
     if (imported) next.assets.push_back(*imported);
     for (auto& track : next.tracks) if (track.id == id && track.midi)
     { if (!track.sampler) track.samplerBypass = false; track.sampler = true; track.sample = asset; track.sampleOffset = offset; track.sampleDuration = duration;
+      if (presetRoot >= 0) { track.rootNote = presetRoot; track.samplerGain = 1; }
       return edit(std::move(next), "Load sampler"); }
     return false;
 }
@@ -173,7 +175,7 @@ bool ProjectSession::removeSampler(const juce::String& id)
     auto next = state;
     for (auto& track : next.tracks) if (track.id == id && track.sampler)
     { track.sampler = false; track.samplerBypass = false; track.sample.clear(); track.sampleOffset = track.sampleDuration = 0;
-      track.rootNote = 60; track.samplerGain = 1; return edit(std::move(next), "Remove sampler instrument"); }
+      track.rootNote = 60; track.samplerGain = 1; track.samplerOneShot = track.samplerLoop = false; return edit(std::move(next), "Remove sampler instrument"); }
     return false;
 }
 bool ProjectSession::moveSampler(const juce::String& source, const juce::String& destination)
@@ -183,9 +185,10 @@ bool ProjectSession::moveSampler(const juce::String& source, const juce::String&
     auto to = std::find_if(next.tracks.begin(), next.tracks.end(), [&](const auto& track) { return track.id == destination; });
     if (from == next.tracks.end() || to == next.tracks.end() || from == to || !from->sampler || !to->midi || to->sampler) return false;
     to->sampler = true; to->samplerBypass = from->samplerBypass; to->sample = from->sample; to->sampleOffset = from->sampleOffset;
+    to->samplerOneShot = from->samplerOneShot; to->samplerLoop = from->samplerLoop;
     to->sampleDuration = from->sampleDuration; to->rootNote = from->rootNote; to->samplerGain = from->samplerGain;
     from->sampler = false; from->samplerBypass = false; from->sample.clear(); from->sampleOffset = from->sampleDuration = 0;
-    from->rootNote = 60; from->samplerGain = 1;
+    from->rootNote = 60; from->samplerGain = 1; from->samplerOneShot = from->samplerLoop = false;
     return edit(std::move(next), "Move sampler instrument");
 }
 bool ProjectSession::bypassSampler(const juce::String& id, bool bypass)
@@ -195,6 +198,13 @@ bool ProjectSession::setSamplerGain(const juce::String& id, double gain)
     auto next = state;
     for (auto& track : next.tracks) if (track.id == id && track.sampler)
     { track.samplerGain = gain; return edit(std::move(next), "Sampler volume", false); }
+    return false;
+}
+bool ProjectSession::setSamplerMode(const juce::String& id, bool oneShot, bool loop)
+{
+    auto next = state;
+    if (auto* track = findTrack(next, id)) if (track->sampler)
+    { track->samplerOneShot = oneShot; track->samplerLoop = loop; return edit(std::move(next), "Sampler playback mode"); }
     return false;
 }
 
@@ -210,7 +220,10 @@ bool ProjectSession::deleteTrack(const juce::String& id)
     auto next = state;
     const auto* root = findId(state.tracks, id); if (!root) return false;
     juce::StringArray removed {id}; if (root->group) for (const auto& track : state.tracks) if (inGroup(state, track, id)) removed.add(track.id);
-    for (auto& track : next.tracks) if (removed.contains(track.outputTrack)) track.outputTrack = "master";
+    for (auto& track : next.tracks)
+    { if (removed.contains(track.outputTrack)) track.outputTrack = "master";
+      for (auto& plugin : track.plugins) if (removed.contains(plugin.sidechain)) plugin.sidechain.clear(); }
+    for (auto& plugin : next.master.plugins) if (removed.contains(plugin.sidechain)) plugin.sidechain.clear();
     erase(next.tracks, [&](const auto& value) { return removed.contains(value.id); });
     erase(next.clips, [&](const auto& value) { return removed.contains(value.track); });
     return edit(std::move(next), "Delete track");
@@ -219,9 +232,11 @@ bool ProjectSession::deleteTrack(const juce::String& id)
 bool ProjectSession::addPlugin(const juce::String& id, Plugin plugin, bool createTrack)
 {
     auto next = state;
-    if (createTrack && !findId(next.tracks, id)) { Track track { id, numberedTrackName(plugin.instrument ? "MIDI" : "Audio", nextTrackNumber(next)) }; track.sends = {0, 0}; track.midi = plugin.instrument; track.monitor = plugin.instrument ? 1 : 2; insertTrack(next, std::move(track)); }
+    const auto midiEffect = isMidiEffect(plugin);
+    if (createTrack && !findId(next.tracks, id)) { Track track { id, numberedTrackName(plugin.instrument || midiEffect ? "MIDI" : "Audio", nextTrackNumber(next)) }; track.sends = {0, 0}; track.midi = plugin.instrument || midiEffect; track.monitor = track.midi ? 1 : 2; insertTrack(next, std::move(track)); }
     if (auto* track = findTrack(next, id))
-    { if (plugin.instrument) track->plugins.insert(track->plugins.begin(), std::move(plugin));
+    { if (midiEffect) track->plugins.insert(track->plugins.begin(), std::move(plugin));
+      else if (plugin.instrument) track->plugins.insert(std::find_if(track->plugins.begin(), track->plugins.end(), [](const auto& item) { return !isMidiEffect(item); }), std::move(plugin));
       else track->plugins.push_back(std::move(plugin)); return edit(std::move(next), "Add plug-in"); }
     return false;
 }
@@ -239,7 +254,9 @@ bool ProjectSession::movePlugin(const juce::String& source, const juce::String& 
     if (!from || !to) return false;
     const auto* plugin = findId(from->plugins, id); if (!plugin) return false; const auto copy = *plugin;
     erase(from->plugins, [&](const auto& item) { return item.id == id; });
-    if (copy.instrument) to->plugins.insert(to->plugins.begin(), copy); else to->plugins.push_back(copy);
+    if (isMidiEffect(copy)) to->plugins.insert(to->plugins.begin(), copy);
+    else if (copy.instrument) to->plugins.insert(std::find_if(to->plugins.begin(), to->plugins.end(), [](const auto& item) { return !isMidiEffect(item); }), copy);
+    else to->plugins.push_back(copy);
     return edit(std::move(next), "Move plug-in");
 }
 bool ProjectSession::bypassPlugin(const juce::String& trackId, const juce::String& id, bool bypass)

@@ -152,16 +152,18 @@ private: EditorPresenter& presenter; int mode = -1; float down = 0; double befor
 class Timeline::Master final : public juce::Component, public juce::DragAndDropTarget
 {
 public:
-    explicit Master(Timeline& owner) : timeline(owner), presenter(owner.presenter), automation(presenter, "master")
+    explicit Master(Timeline& owner) : timeline(owner), presenter(owner.presenter), volume(owner.presenter, "master"), automation(presenter, "master")
     {
-        for (auto* control : std::initializer_list<juce::Component*> {&name, &fold, &volume, &cue, &meter, &pan, &parameter, &outputRoute, &cueOutput}) addAndMakeVisible(control);
-        addChildComponent(automation); label(name, "Main"); name.addMouseListener(this, false); setWantsKeyboardFocus(true);
+        for (auto* control : std::initializer_list<juce::Component*> {&name, &fold, &volume, &cue, &meter, &pan, &parameter, &outputRoute, &cueOutput, &volumeLabel, &cueLabel, &panLabel}) addAndMakeVisible(control);
+        addChildComponent(automation); label(name, "Master"); name.addMouseListener(this, false); setWantsKeyboardFocus(true);
         name.getProperties().set("track-title", true); name.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
         fold.getProperties().set("track-fold", true); fold.onClick = [this] { presenter.toggleTrackFold("master"); timeline.resized(); };
-        for (auto* slider : {&volume, &cue})
+        label(volumeLabel, "Volume"); label(cueLabel, "Cue"); label(panLabel, "Pan");
+        for (auto* field : {&volumeLabel, &cueLabel, &panLabel}) field->setFont(juce::FontOptions(9));
+        for (auto* slider : std::initializer_list<juce::Slider*> {&volume, &cue})
         {
             slider->getProperties().set("mixer-volume", true); slider->setScrollWheelEnabled(false);
-            slider->setRange(0, 2, 0.001); slider->setSkewFactor(0.3); slider->setSliderStyle(juce::Slider::LinearBarVertical);
+            slider->setRange(0, 2, 0.001); slider->setSkewFactor(0.5); slider->setSliderStyle(juce::Slider::LinearBarVertical);
             slider->setSliderSnapsToMousePosition(false); slider->setTextBoxStyle(juce::Slider::TextBoxLeft, false, 48, 14);
             slider->textFromValueFunction = [](double value) { return volumeText(value).replace(" dB", ""); };
             slider->valueFromTextFunction = [](const juce::String& text) { return text.containsChar(0x221e) || text.containsIgnoreCase("inf") ? 0.0 : juce::jlimit(0.0, 2.0, std::pow(10.0, text.getDoubleValue() / 20)); };
@@ -169,20 +171,21 @@ public:
             slider->onDragStart = [this] { presenter.beginGesture(); }; slider->onDragEnd = [this] { presenter.endGesture(false); };
         }
         volume.getProperties().set("master-volume", true); volume.getProperties().set("midi-target", "track/master/volume");
-        volume.setTitle("Main volume"); volume.onValueChange = [this] { presenter.setMaster(static_cast<float>(volume.getValue())); };
+        volume.setTitle("Master volume — all tracks and returns");
+        volume.onDragStart = [this] { presenter.selectTrack("master"); presenter.beginGesture(); };
         cue.getProperties().set("midi-target", "cue"); cue.setTitle("Cue / metronome volume"); cue.onValueChange = [this] { presenter.setCue(cue.getValue()); };
         configurePanSlider(pan); pan.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 48, 14); pan.setScrollWheelEnabled(false);
         pan.getProperties().set("midi-target", "track/master/pan"); pan.onValueChange = [this] { presenter.setPan("master", pan.getValue()); };
         pan.onDragStart = [this] { presenter.beginGesture(); }; pan.onDragEnd = [this] { presenter.endGesture(false); };
         parameter.setScrollWheelEnabled(false); parameter.addItem("Volume", 1); parameter.addItem("Pan", 2); parameter.addItem("Mute", 3);
         parameter.onChange = [this] { presenter.setAutomationParameter("master", parameter.getSelectedId() - 1); };
-        outputRoute.setTitle("Main output"); outputRoute.setScrollWheelEnabled(false); cueOutput.setTitle("Cue output"); cueOutput.setScrollWheelEnabled(false);
+        outputRoute.setTitle("Master output"); outputRoute.setScrollWheelEnabled(false); cueOutput.setTitle("Cue output"); cueOutput.setScrollWheelEnabled(false);
         outputRoute.onChange = [this] { if (outputRoute.getSelectedId() > 0) presenter.setOutputPair(outputRoute.getSelectedId() - 1); };
     }
     int desiredHeight() const { return presenter.trackFolded("master") ? 18 : 88; }
     void tick()
     {
-        if (!volume.isMouseButtonDown()) volume.setValue(presenter.trackValue("master", false), juce::dontSendNotification);
+        if (!volume.isMouseButtonDown(true)) volume.setValue(presenter.trackValue("master", false), juce::dontSendNotification);
         if (!cue.isMouseButtonDown()) cue.setValue(presenter.project().cueGain, juce::dontSendNotification);
         if (!pan.isMouseButtonDown()) pan.setValue(presenter.trackValue("master", true), juce::dontSendNotification);
         const auto colour = trackColour(presenter.project(), "master", presenter.viewState().selectedTracks.contains("master"));
@@ -205,9 +208,11 @@ public:
         const auto header = getLocalBounds().removeFromRight(headerWidth); const auto x = header.getX();
         fold.setBounds(x + 3, 3, 14, 14); name.setBounds(x + 18, 2, 77, 18);
         const bool expanded = !presenter.trackFolded("master");
-        for (auto* control : std::initializer_list<juce::Component*> {&volume, &cue, &pan, &outputRoute, &cueOutput}) control->setVisible(expanded);
+        for (auto* control : std::initializer_list<juce::Component*> {&volume, &cue, &pan, &outputRoute, &cueOutput, &volumeLabel, &cueLabel, &panLabel}) control->setVisible(expanded);
         outputRoute.setBounds(x + 100, 3, 79, 14); cueOutput.setBounds(x + 100, 21, 79, 14);
-        cue.setBounds(x + 184, 3, 48, 14); volume.setBounds(x + 237, 3, 47, 14); pan.setBounds(x + 237, 21, 47, 14);
+        volumeLabel.setBounds(x + 184, 3, 38, 14); volume.setBounds(x + 225, 3, 59, 14);
+        cueLabel.setBounds(x + 184, 21, 38, 14); cue.setBounds(x + 225, 21, 59, 14);
+        panLabel.setBounds(x + 184, 39, 38, 14); pan.setBounds(x + 225, 39, 59, 14);
         meter.setBounds(header.getRight() - 11, 3, 7, getHeight() - 7); parameter.setBounds(x + 100, 39, 79, 14);
         automation.setBounds(0, 22, timeline.lanes.getViewWidth(), std::max(0, getHeight() - 24));
     }
@@ -234,7 +239,7 @@ public:
     { return x < timeline.lanes.getViewWidth() || x >= getWidth() - headerWidth; }
     void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
     { timeline.lanes.mouseWheelMove(event.getEventRelativeTo(&timeline.lanes), wheel); }
-private: Timeline& timeline; EditorPresenter& presenter; juce::Label name; juce::TextButton fold; juce::Slider volume, cue, pan; juce::ComboBox parameter, outputRoute, cueOutput; LevelMeter meter; AutomationLane automation;
+private: Timeline& timeline; EditorPresenter& presenter; juce::Label name, volumeLabel, cueLabel, panLabel; juce::TextButton fold; TrackVolumeSlider volume; juce::Slider cue, pan; juce::ComboBox parameter, outputRoute, cueOutput; LevelMeter meter; AutomationLane automation;
 };
 class Timeline::Headers final : public juce::Component
 {
@@ -258,7 +263,7 @@ public:
             gain.setScrollWheelEnabled(false); pan.setScrollWheelEnabled(false);
             for (auto* control : { &parameter, &inputSource, &inputChannel, &outputRoute }) control->setScrollWheelEnabled(false);
             inputSource.addItem("Ext. In", 1); inputSource.addItem("No Input", 2);
-            inputChannel.addItem("1", 1); outputRoute.addItem("Main", 1); outputRoute.addItem("No Output", 2);
+            inputChannel.addItem("1", 1); outputRoute.addItem("Master", 1); outputRoute.addItem("No Output", 2);
             inputSource.setTitle("Track input"); inputChannel.setTitle("Input channel"); outputRoute.setTitle("Audio output");
             const auto routing = [this]
             { if (const auto* track = findTrack(presenter.project(), id))
@@ -454,8 +459,8 @@ public:
           const auto& choices = presenter.outputChoices();
           if (destinations != choices || routeParent != track.parentGroup)
           { destinations = choices; routeParent = track.parentGroup; outputRoute.clear(juce::dontSendNotification);
-            const auto* parent = findTrack(presenter.project(), track.parentGroup); outputRoute.addItem(parent ? parent->name : "Main", 1); outputRoute.addItem("No Output", 2);
-            if (parent) outputRoute.addItem("Main", 3);
+            const auto* parent = findTrack(presenter.project(), track.parentGroup); outputRoute.addItem(parent ? parent->name : "Master", 1); outputRoute.addItem("No Output", 2);
+            if (parent) outputRoute.addItem("Master", 3);
             for (size_t index = 0; index < destinations.size(); ++index) if (destinations[index].first != id)
             { outputRoute.addItem(destinations[index].second, static_cast<int>(index) + 4);
  } }
@@ -1015,7 +1020,7 @@ public:
     void mouseDoubleClick(const juce::MouseEvent& event) override
     {
         // JUCE sends double-click immediately after mouseDown, before the resize drag.
-        if (mode == 1 || mode == 2 || event.mods.isAltDown() || event.mods.isShiftDown() || event.mods.isCommandDown() || event.mods.isCtrlDown()) return;
+        if (!event.mods.isLeftButtonDown() || mode == 1 || mode == 2 || event.mods.isAltDown() || event.mods.isShiftDown() || event.mods.isCommandDown() || event.mods.isCtrlDown()) return;
         const auto trackId = trackAt(event.y); const auto* track = findId(owner.presenter.project().tracks, trackId);
         if (!track || !track->midi) return;
         finishGesture(false);
@@ -1209,6 +1214,8 @@ Timeline::Timeline(EditorPresenter& owner) : presenter(owner)
     setLocator.onClick = [this] { presenter.addLocator(); };
     previousLocator.onClick = [this] { presenter.jumpLocator(false); }; nextLocator.onClick = [this] { presenter.jumpLocator(true); };
     lanes.setViewedComponent(canvas.get(), false); headers.setViewedComponent(trackHeaders.get(), false);
+    lanes.addMouseListener(this, true);
+    lanes.onZoom = [this](const auto& event, float scale) { canvas->mouseMagnify(event.getEventRelativeTo(canvas.get()), scale); };
     headers.setScrollBarsShown(false, false); headers.wheelTarget = &lanes; lanes.setScrollBarsShown(true, true);
     lanes.getVerticalScrollBar().setAutoHide(true);
     lanes.setScrollOnDragMode(juce::Viewport::ScrollOnDragMode::never);
@@ -1244,13 +1251,26 @@ void Timeline::paint(juce::Graphics& graphics)
 }
 void Timeline::mouseDown(const juce::MouseEvent& event)
 {
+    if (event.mods.isMiddleButtonDown() && event.eventComponent != this && !presenter.gesturing())
+    { panning = true; panStart = event.getScreenPosition(); panScroll = lanes.getViewPosition();
+      canvas->setMouseCursor(juce::MouseCursor::DraggingHandCursor); return; }
+    if (event.eventComponent != this) return;
     if (!event.mods.isLeftButtonDown() || event.y >= 22 || event.x < 5 || event.x >= getWidth() - headerWidth) return;
     double duration = 30;
     for (const auto& clip : presenter.project().clips) if (clip.scene < 0) duration = std::max(duration, clip.start + clip.duration);
     const auto time = (event.x - 5.0) / std::max(1, getWidth() - headerWidth - 12) * duration;
     lanes.setViewPosition(juce::roundToInt(std::max(0.0, time * presenter.viewState().pixelsPerSecond - lanes.getViewWidth() * 0.5)), lanes.getViewPositionY());
 }
-void Timeline::mouseDrag(const juce::MouseEvent& event) { if (event.getMouseDownY() < 22) mouseDown(event); }
+void Timeline::mouseDrag(const juce::MouseEvent& event)
+{
+    if (panning) { lanes.setViewPosition(panScroll - (event.getScreenPosition() - panStart)); return; }
+    if (event.eventComponent == this && event.getMouseDownY() < 22) mouseDown(event);
+}
+void Timeline::mouseUp(const juce::MouseEvent&)
+{
+    if (!panning) return;
+    panning = false; canvas->setMouseCursor(juce::MouseCursor::NormalCursor);
+}
 void Timeline::resized()
 {
     restoring = true;

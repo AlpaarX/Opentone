@@ -95,6 +95,8 @@ public:
         : DocumentWindow(name, juce::Colour(0xff30343b), closeButton), owner(host)
     { setUsingNativeTitleBar(true); setContentOwned(editor, true); setResizable(editor->isResizable(), false); setAlwaysOnTop(true);
       addKeyListener(this); editor->addKeyListener(this); centreWithSize(getWidth(), getHeight()); setVisible(true); }
+    ~Window() override
+    { if (auto* editor = dynamic_cast<juce::AudioProcessorEditor*>(getContentComponent())) editor->getAudioProcessor()->editorBeingDeleted(editor); clearContentComponent(); }
     void closeButtonPressed() override { setVisible(false); }
 private:
     bool keyPressed(const juce::KeyPress& key, juce::Component* source) override
@@ -124,7 +126,10 @@ juce::Array<juce::PluginDescription> PluginHost::availablePlugins() const
 {
     auto result = known.getTypes();
     for (auto& plugin : result) if (const auto found = categories.find(plugin.createIdentifierString()); found != categories.end()) plugin.isInstrument = found->second;
-    result.add(utilityDescription()); result.addArray(builtinPluginDescriptions()); return result;
+    result.add(utilityDescription());
+    // shortcut: rack creation is import-only; add pad authoring when requested.
+    for (const auto& plugin : builtinPluginDescriptions()) if (plugin.fileOrIdentifier != "opentone.drumrack") result.add(plugin);
+    return result;
 }
 void PluginHost::assignCategory(const juce::String& identifier, bool instrument)
 {
@@ -182,7 +187,7 @@ void PluginHost::prepareSlot(Slot& slot)
 void PluginHost::prepare(double nextRate, int nextBlock)
 {
     const juce::ScopedLock lock(mutex); rate = nextRate; block = std::max(1, nextBlock); expectedFrame = -1;
-    for (auto& pair : buses) { pair.second->audio.setSize(2, block); pair.second->feedback.setSize(2, block); pair.second->feedback.clear(); }
+    for (auto& pair : buses) { pair.second->audio.setSize(2, block); pair.second->postFx.setSize(2, block); pair.second->feedback.setSize(2, block); pair.second->feedback.clear(); }
     for (auto& pair : slots) if (pair.second->instance)
     { pair.second->instance->releaseResources(); prepareSlot(*pair.second); }
 }
@@ -229,7 +234,7 @@ void PluginHost::sync(const Project& project, uint64_t generation, bool allowLoo
         {
             const auto& track = *item;
             tracks.insert(track.id); auto& input = buses[track.id];
-            if (!input) { input = std::make_shared<Bus>(); input->audio.setSize(2, block); input->feedback.setSize(2, block); input->feedback.clear(); input->midi.ensureSize(65536); input->queued.ensureSize(4096); }
+            if (!input) { input = std::make_shared<Bus>(); input->audio.setSize(2, block); input->postFx.setSize(2, block); input->feedback.setSize(2, block); input->feedback.clear(); input->midi.ensureSize(65536); input->queued.ensureSize(4096); }
             input->group = track.group; input->inputEnabled = !track.midi && track.inputEnabled; input->outputEnabled = track.outputEnabled; input->monitor = track.monitor;
             input->returnIndex = track.returnIndex;
             input->sends.resize(returnBuses.size(), 0); input->previousSends.resize(returnBuses.size(), 0);
@@ -266,7 +271,18 @@ void PluginHost::sync(const Project& project, uint64_t generation, bool allowLoo
             ordered.push_back({routingDepth(project, track), input});
         }
         std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-        for (const auto& item : ordered) processingOrder.push_back(item.second);
+        // Sidechain sources and routed children must finish before their consumers.
+        std::map<Bus*, int> visited;
+        std::function<void(const std::shared_ptr<Bus>&)> visit = [&](const auto& input)
+        {
+            auto& state = visited[input.get()]; if (state == 2) return; if (state == 1) return; state = 1;
+            for (const auto& child : ordered) if (child.second->parent == input) visit(child.second);
+            for (const auto& slot : input->slots) if (slot->model.sidechain.isNotEmpty())
+                if (const auto source = buses.find(slot->model.sidechain); source != buses.end())
+                { if (visited[source->second.get()] == 1) slot->error = "Cyclic sidechain routing."; else visit(source->second); }
+            state = 2; processingOrder.push_back(input);
+        };
+        for (const auto& item : ordered) visit(item.second);
         for (auto it = buses.begin(); it != buses.end();) if (!tracks.count(it->first)) it = buses.erase(it); else ++it;
         for (auto it = slots.begin(); it != slots.end();)
             if (!retained.count(it->first))
@@ -337,9 +353,12 @@ void PluginHost::finishBlock(float* const* output, int channels, int samples, fl
             if (count == 1 && !slot->model.instrument)
             { input.audio.addFrom(0, 0, input.audio, 1, 0, samples); input.audio.applyGain(0, 0, samples, 0.5f); }
             juce::AudioBuffer<float> buffer(input.audio.getArrayOfWritePointers(), count, samples);
+            const auto source = buses.find(slot->model.sidechain);
+            setBuiltinSidechain(instance, source != buses.end() ? &source->second->postFx : nullptr);
             instance.processBlock(buffer, *midi);
             if (instance.getTotalNumOutputChannels() == 1) input.audio.copyFrom(1, 0, input.audio, 0, 0, samples);
         }
+        for (int channel = 0; channel < 2; ++channel) input.postFx.copyFrom(channel, 0, input.audio, channel, 0, samples);
         const auto end = static_cast<double>(frame + (playing ? samples : 0)) / rate;
         bool ancestorMuted = false;
         for (auto parent = input.parent; parent; parent = parent->parent) if (parent->muted || automationValue(parent->muteAutomation, end, 0) >= 0.5) { ancestorMuted = true; break; }
@@ -408,7 +427,7 @@ bool PluginHost::preview(const juce::String& track, int pitch, double velocity, 
 {
     if (pitch < 0 || pitch > 127 || !std::isfinite(velocity) || velocity <= 0 || velocity > 1) return false;
     const juce::ScopedLock lock(mutex); const auto input = bus(track);
-    if (!input || input->slots.empty() || !input->slots.front()->model.instrument) return false;
+    if (!input || input->slots.empty() || !std::any_of(input->slots.begin(), input->slots.end(), [](const auto& slot) { return slot->model.instrument; })) return false;
     if (replace && !held) release(track, -1, true);
     auto& note = input->previews[static_cast<size_t>(pitch)];
     if (note.on) input->queued.addEvent(juce::MidiMessage::noteOff(1, pitch), 0);
@@ -460,7 +479,7 @@ void PluginHost::updateEditorWindowLevels()
 void PluginHost::showEditor(const juce::String& id)
 {
     const auto found = slots.find(id); if (found == slots.end() || !found->second->instance) return;
-    if (found->second->builtin && found->second->instance->getActiveEditor() && !windows.count(id)) return;
+    if (found->second->builtin) return;
     auto& window = windows[id];
     if (!window)
     { auto& instance = *found->second->instance;

@@ -12,11 +12,21 @@ using Xml = juce::XmlElement;
 const Xml* path(const Xml* node, const juce::String& address)
 {
     for (const auto& part : juce::StringArray::fromTokens(address, "/", ""))
-    { if (!node) return nullptr; node = node->getChildByName(part); }
+    { if (!node) return nullptr;
+      const auto* child = node->getChildByName(part);
+      if (!child && part == "DeviceChain" && node->hasTagName("MasterTrack")) child = node->getChildByName("MasterChain");
+      node = child; }
     return node;
 }
 juce::String value(const Xml* node, const juce::String& address, juce::String fallback = {})
-{ const auto* item = path(node, address); return item ? item->getStringAttribute("Value", fallback) : fallback; }
+{
+    if (const auto* item = path(node, address)) return item->getStringAttribute("Value", fallback);
+    // Live 8 stores the initial parameter value in its arrangement envelope.
+    if (address.endsWith("/Manual"))
+        if (const auto* events = path(node, address.dropLastCharacters(7) + "/ArrangerAutomation/Events"))
+            if (const auto* initial = events->getFirstChildElement()) return initial->getStringAttribute("Value", fallback);
+    return fallback;
+}
 double numeric(const juce::String& text, double fallback)
 {
     if (text.isEmpty()) return fallback;
@@ -96,6 +106,11 @@ struct Importer
     juce::File resolve(const Xml* ref)
     {
         auto relative = value(ref, "FileRef/RelativePath").replace("\\", "/");
+        if (relative.isEmpty()) if (const auto* parts = path(ref, "FileRef/RelativePath"))
+        {
+            for (const auto* part : parts->getChildIterator()) relative += part->getStringAttribute("Dir") + "/";
+            relative += value(ref, "FileRef/Name");
+        }
         const auto absolute = value(ref, "FileRef/Path").replace("\\", "/");
         if (juce::File::isAbsolutePath(absolute)) { const juce::File file(absolute); if (file.existsAsFile()) return file; }
         if (relative.isNotEmpty())
@@ -181,7 +196,7 @@ struct Importer
         const auto routing = value(input, "DeviceChain/AudioOutputRouting/Target"); track.outputEnabled = !routing.containsIgnoreCase("None");
         if (track.id != "master" && (routing.contains("Main") || routing.contains("Master"))) track.outputTrack = "master";
         else if (track.id != "master" && routing.contains("Track.")) track.outputTrack = routing.fromFirstOccurrenceOf("Track.", false, false).upToFirstOccurrenceOf("/", false, false);
-        else if (routing.isNotEmpty() && !routing.contains("Main") && !routing.contains("Master") && !(routing.contains("Group") && track.parentGroup.isNotEmpty()) && !routing.containsIgnoreCase("None")) warn("External/unrecognized output routing was mapped to Main.");
+        else if (routing.isNotEmpty() && !routing.contains("Main") && !routing.contains("Master") && !(routing.contains("Group") && track.parentGroup.isNotEmpty()) && !routing.containsIgnoreCase("None")) warn("External/unrecognized output routing was mapped to Master.");
         if (track.returnIndex < 0 && track.id != "master") track.monitor = juce::jlimit(0, 2, static_cast<int>(juce::jlimit(0.0, 2.0, number(input, "DeviceChain/MainSequencer/MonitoringEnum", 1))));
         if (track.returnIndex < 0 && track.id != "master" && !track.group)
         { track.armed = boolean(input, "DeviceChain/MainSequencer/Recorder/IsArmed", false);
@@ -195,13 +210,80 @@ struct Importer
     }
     void devices(const Xml* input, Track& track)
     {
-        const auto* items = path(input, "DeviceChain/DeviceChain/Devices"); if (!items) return;
+        deviceList(path(input, "DeviceChain/DeviceChain/Devices"), track);
+    }
+    void deviceList(const Xml* items, Track& track, int depth = 0)
+    {
+        if (!items) return;
+        if (depth > 8) throw std::runtime_error("Live rack nesting exceeds eight levels.");
         if (items->getNumChildElements() > 128) throw std::runtime_error("A Live track exceeds 128 devices.");
         for (auto* device : items->getChildIterator())
         {
             const auto tag = device->getTagName(); std::map<juce::String, float> params; juce::String id;
             const auto manual = [&](const char* name, double fallback) { return static_cast<float>(number(device, juce::String(name) + "/Manual", fallback)); };
-            if (tag == "Reverb")
+            if (tag == "Operator")
+            {
+                id = "opentone.operator";
+                const auto algorithm = static_cast<int>(manual("Globals/Algorithm", 0));
+                if (algorithm != 0) throw std::runtime_error("This Operator algorithm is not yet supported by the Live importer.");
+                params = {{"algorithm", 0}, {"volume", juce::Decibels::gainToDecibels(manual("Globals/Volume", 0.25), -48.0f)},
+                    {"transpose", manual("Globals/Transpose", 0)}, {"filter_on", boolean(device, "Filter/OnOff/Manual", false) ? 1.0f : 0.0f},
+                    {"filter", manual("Filter/Frequency", 18000)}, {"resonance", (manual("Filter/Resonance", 1) - 0.5f) / 4},
+                    {"filter_env", manual("Filter/EnvelopeAmount", 0) * 0.08f},
+                    {"filter_attack", manual("Filter/Envelope/AttackTime", 0.1)}, {"filter_decay", manual("Filter/Envelope/DecayTime", 600)},
+                    {"filter_sustain", manual("Filter/Envelope/SustainLevel", 0)}, {"filter_release", manual("Filter/Envelope/ReleaseTime", 50)},
+                    {"pitch_on", boolean(device, "PitchEnv/PitchEnvOn/Manual", false) ? 1.0f : 0.0f},
+                    {"pitch_peak", manual("PitchEnv/PitchEnv/DecayLevel", 12)}, {"pitch_attack", manual("PitchEnv/PitchEnv/AttackTime", 0.1)},
+                    {"pitch_decay", manual("PitchEnv/PitchEnv/DecayTime", 600)}, {"pitch_sustain", manual("PitchEnv/PitchEnv/SustainLevel", 0)},
+                    {"pitch_release", manual("PitchEnv/PitchEnv/ReleaseTime", 50)}};
+                for (int op = 0; op < 4; ++op)
+                {
+                    const auto from = "Operator." + juce::String(op) + "/", to = juce::String::charToString(static_cast<juce::juce_wchar>('a' + op)) + "_";
+                    const auto read = [&](const char* field, double fallback) { return static_cast<float>(number(device, from + field + "/Manual", fallback)); };
+                    const auto wave = static_cast<int>(read("WaveForm", 0));
+                    if (wave != 0 && wave != 10 && wave != 18 && wave != 19) throw std::runtime_error("This Operator waveform is not yet supported by the Live importer.");
+                    params[to + "wave"] = wave == 10 ? 2.0f : wave == 18 ? 3.0f : wave == 19 ? 1.0f : 0.0f;
+                    const auto level = read("Volume", 0);
+                    params[to + "level"] = boolean(device, from + "IsOn/Manual", true) && level > 0.0003163f ? level : 0;
+                    params[to + "ratio"] = std::max(0.5f, read("Tune/Coarse", 1)) * (1 + read("Tune/Fine", 0) / 1000);
+                    params[to + "fixed"] = boolean(device, from + "Tune/FixedFrequencyOn/Manual", false) ? 1.0f : 0.0f;
+                    params[to + "frequency"] = read("Tune/FixedFrequency", 100); params[to + "phase"] = read("Phase", 0) / 100;
+                    params[to + "velocity"] = std::max(0.0f, read("VelScale", 0) / 100);
+                    params[to + "attack"] = read("Envelope/AttackTime", 0.1); params[to + "decay"] = read("Envelope/DecayTime", 600);
+                    params[to + "sustain"] = read("Envelope/SustainLevel", 1); params[to + "release"] = read("Envelope/ReleaseTime", 50);
+                }
+                warn("Operator uses native Opentone synthesis; oscillator, envelope and filter DSP can differ from Live.");
+            }
+            else if (tag == "DrumGroupDevice" || tag == "InstrumentGroupDevice")
+            {
+                std::vector<DrumRackBranch> branches;
+                const auto* list = path(device, "Branches");
+                if (list && list->getNumChildElements() > 128) throw std::runtime_error("Live rack exceeds 128 chains.");
+                if (list) for (const auto* branch : list->getChildIterator())
+                {
+                    Track child {newId(), value(branch, "Name/UserName", "Chain")}; child.midi = true;
+                    deviceList(path(branch, "DeviceChain/MidiToAudioDeviceChain/Devices"), child, depth + 1);
+                    DrumRackBranch model; model.name = child.name; model.devices = std::move(child.plugins);
+                    model.receive = tag == "DrumGroupDevice" ? static_cast<int>(number(branch, "BranchInfo/ReceivingNote", -1)) : -1;
+                    model.send = static_cast<int>(number(branch, "BranchInfo/SendingNote", 60));
+                    model.gain = static_cast<float>(number(branch, "MixerDevice/Volume/Manual", 1)); model.pan = static_cast<float>(number(branch, "MixerDevice/Panorama/Manual", 0));
+                    model.mute = !boolean(branch, "MixerDevice/Speaker/Manual", true);
+                    if (model.receive < -1 || model.receive > 127 || model.send < 0 || model.send > 127) throw std::runtime_error("Invalid drum rack MIDI mapping.");
+                    branches.push_back(std::move(model));
+                }
+                auto rack = builtinDrumRackModel(branches);
+                if (rack.id.isEmpty()) throw std::runtime_error("A rack contains devices that cannot yet execute natively.");
+                rack.bypass = !boolean(device, "On/Manual", true); track.plugins.push_back(std::move(rack)); continue;
+            }
+            else if (tag == "MidiNoteLength")
+            { id = "opentone.notelength"; params = {{"length", manual("TimeLength", 100)}, {"gate", manual("Gate", 100)}, {"sync", boolean(device, "SyncState/Manual", false) ? 1.0f : 0.0f}, {"division", manual("SyncedLength", 4) - 2}}; }
+            else if (tag == "Tube")
+            { id = "opentone.tube"; params = {{"drive", manual("PreDrive", 0)}, {"output", manual("PostDrive", 0)}, {"bias", manual("Bias", 0) / 100}, {"envelope", manual("AutoBias", 0) / 100}, {"attack", manual("AutoBiasAttack", 5)}, {"release", manual("AutoBiasRelease", 35)}, {"tone", manual("Tone", 0)}, {"type", manual("Type", 0)}, {"mix", manual("DryWet", 1)}}; }
+            else if (tag == "Saturator")
+            { id = "opentone.saturator"; params = {{"drive", manual("PreDrive", 0)}, {"output", manual("PostDrive", 0)}, {"type", manual("Type", 0)}, {"mix", manual("DryWet", 1)}, {"color", boolean(device, "ColorOn/Manual", false) ? 1.0f : 0.0f}, {"post", boolean(device, "PostClip/Manual", false) ? 1.0f : 0.0f}, {"dc", boolean(device, "PreDcFilter", false) ? 1.0f : 0.0f}}; }
+            else if (tag == "Compressor2")
+            { id = "opentone.compressor"; params = {{"threshold", juce::Decibels::gainToDecibels(manual("Threshold", 0.125), -60.0f)}, {"ratio", manual("Ratio", 4)}, {"attack", manual("Attack", 10)}, {"release", manual("Release", 100)}, {"knee", manual("Knee", 6)}, {"makeup", manual("Gain", 0)}, {"auto_makeup", boolean(device, "GainCompensation/Manual", false) ? 1.0f : 0.0f}, {"mix", manual("SideChain/DryWet", 1)}, {"side_eq", boolean(device, "SideEqOn/Manual", false) ? 1.0f : 0.0f}, {"side_frequency", manual("SideEqFreq", 276)}, {"side_q", manual("SideEqQ", 1)}}; }
+            else if (tag == "Reverb")
             { id = "opentone.reverb"; params = {{"mix", manual("MixDirect", 0.25)}, {"predelay", manual("PreDelay", 15)}, {"size", manual("RoomSize", 65) / 100}, {"width", manual("StereoSeparation", 100) / 100}}; }
             else if (tag == "Delay" || tag == "PingPongDelay" || tag == "FilterDelay" || tag == "SimpleDelay")
             { id = "opentone.delay"; params = {{"mix", manual("DryWet", 0.25)}, {"feedback", manual("Feedback", 0.35)}, {"ping", boolean(device, "DelayLine_PingPong/Manual", tag == "PingPongDelay") ? 1.0f : 0.0f}}; }
@@ -219,7 +301,12 @@ struct Importer
                 warn("Simpler/Sampler was converted to Opentone Sampler; envelopes, filters, slicing and modulation differ."); continue;
             }
             if (id.isNotEmpty())
-            { auto plugin = builtinPluginModel(id, params); plugin.bypass = !boolean(device, "On/Manual", true); track.plugins.push_back(std::move(plugin)); warn("Live " + tag + " was replaced with Opentone's built-in effect; DSP and some parameters differ."); }
+            { auto plugin = builtinPluginModel(id, params);
+              if (tag == "Compressor2" && boolean(device, "SideChain/OnOff/Manual", false))
+              { const auto route = value(device, "SideChain/RoutedInput/Routable/Target");
+                if (route.contains("Track.")) plugin.sidechain = route.fromFirstOccurrenceOf("Track.", false, false).upToFirstOccurrenceOf("/", false, false);
+                else warn("Unsupported compressor sidechain input."); }
+              plugin.bypass = !boolean(device, "On/Manual", true); track.plugins.push_back(std::move(plugin)); warn("Live " + tag + " was replaced with Opentone's built-in effect; DSP and some parameters differ."); }
             else
             {
                 auto name = value(device, "UserName"); if (name.isEmpty()) name = value(device, "Name");
@@ -338,7 +425,7 @@ struct Importer
     }
     void track(const Xml* input, int returnIndex)
     {
-        Track output {newId(), value(input, "Name/EffectiveName", "Track")}; output.midi = input->hasTagName("MidiTrack"); output.returnIndex = returnIndex;
+        Track output {newId(), value(input, "Name/EffectiveName", value(input, "Name/UserName", "Track"))}; output.midi = input->hasTagName("MidiTrack"); output.returnIndex = returnIndex;
         output.group = input->hasTagName("GroupTrack"); output.groupCollapsed = output.group && !boolean(input, "TrackUnfolded", boolean(input, "Unfolded", true));
         output.folded = !boolean(input, "TrackUnfolded", true);
         output.height = static_cast<int>(juce::jlimit(17.0, 1000.0, number(input, "DeviceChain/AutomationLanes/AutomationLanes/AutomationLane/LaneHeight", 88)));
@@ -397,11 +484,16 @@ LoadResult loadAbletonSet(const juce::File& source, const juce::File& directory)
         for (auto& track : importer.project.tracks) if (track.outputTrack.isNotEmpty() && track.outputTrack != "master")
         { const auto target = importer.trackIds.find(track.outputTrack); const auto* destination = target != importer.trackIds.end() ? findTrack(importer.project, target->second) : nullptr;
           if (destination && !destination->midi && track.returnIndex < 0) track.outputTrack = destination->id;
-          else { track.outputTrack = "master"; importer.warn("Unavailable/MIDI/return output route on " + track.name + " was mapped to Main."); } }
+          else { track.outputTrack = "master"; importer.warn("Unavailable/MIDI/return output route on " + track.name + " was mapped to Master."); } }
         for (auto& track : importer.project.tracks) if (routesTo(importer.project, track, track.id) || routingDepth(importer.project, track) >= 64)
-        { track.outputTrack = "master"; importer.warn("Cyclic/deep audio routing on " + track.name + " was mapped to Main."); }
+        { track.outputTrack = "master"; importer.warn("Cyclic/deep audio routing on " + track.name + " was mapped to Master."); }
         std::stable_partition(importer.project.tracks.begin(), importer.project.tracks.end(), [](const auto& track) { return track.returnIndex < 0; });
         importer.mixer(main, importer.project.master); importer.devices(main, importer.project.master);
+        for (auto* track : allTracks(importer.project)) for (auto& plugin : track->plugins) if (plugin.sidechain.isNotEmpty())
+        { const auto sourceId = importer.trackIds.find(plugin.sidechain);
+          if (sourceId == importer.trackIds.end()) { plugin.sidechain.clear(); importer.warn("Unavailable compressor sidechain source."); }
+          else plugin.sidechain = sourceId->second; }
+
         importer.project.loopStart = std::max(0.0, number(live, "Transport/LoopStart", 0) * importer.beat);
         importer.project.loopEnd = importer.project.loopStart + std::max(0.001, number(live, "Transport/LoopLength", 4) * importer.beat);
         importer.project.loopEnabled = boolean(live, "Transport/LoopOn", false);

@@ -9,6 +9,14 @@ extern juce::Colour background, panel, accent, ink, line, primary;
 enum class UiTone { control, display, range, selectionText, pianoBlack, pianoWhite, detail, record, solo, play, editField };
 juce::Colour uiTone(UiTone);
 class EditorPresenter;
+class TrackVolumeSlider final : public juce::Slider
+{
+public:
+    TrackVolumeSlider(EditorPresenter&, juce::String track);
+private:
+    void valueChanged() override;
+    juce::WeakReference<EditorPresenter> presenter; juce::String track;
+};
 class SendSlider final : public juce::Slider
 {
 public:

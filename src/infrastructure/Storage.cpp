@@ -239,10 +239,11 @@ LoadResult Storage::load(const juce::File& directory)
                 if (!plugin.isObject() || !plugin["id"].isString() || !plugin["name"].isString()
                     || !plugin["description"].isString() || !plugin["state"].isString()
                     || !plugin["instrument"].isBool() || !plugin["bypass"].isBool()) return fail("Invalid plug-in schema.");
+                if (plugin.hasProperty("sidechain") && !plugin["sidechain"].isString()) return fail("Invalid sidechain source.");
                 juce::MemoryBlock bytes; if (plugin["state"].toString().isNotEmpty() && !bytes.fromBase64Encoding(plugin["state"].toString())) return fail("Invalid plug-in state.");
                 if (!juce::XmlDocument::parse(plugin["description"].toString())) return fail("Invalid plug-in description.");
                 output.project.tracks.back().plugins.push_back({ plugin["id"].toString(), plugin["name"].toString(), plugin["description"].toString(),
-                    plugin["state"].toString(), static_cast<bool>(plugin["instrument"]), static_cast<bool>(plugin["bypass"]) });
+                    plugin["state"].toString(), static_cast<bool>(plugin["instrument"]), static_cast<bool>(plugin["bypass"]), plugin["sidechain"].toString() });
             }
         }
         if (value.getDynamicObject()->hasProperty("solo"))
@@ -256,6 +257,9 @@ LoadResult Storage::load(const juce::File& directory)
             track.sampleDuration = static_cast<double>(value["sampleDuration"]); track.rootNote = static_cast<int>(value["rootNote"]);
             if (value.getDynamicObject()->hasProperty("sampler") && !value["sampler"].isBool()) return fail("Invalid instrument schema.");
             track.sampler = value.getDynamicObject()->hasProperty("sampler") ? static_cast<bool>(value["sampler"]) : track.midi;
+            for (auto setting : {std::pair<const char*, bool*> {"samplerOneShot", &track.samplerOneShot}, {"samplerLoop", &track.samplerLoop}})
+                if (value.getDynamicObject()->hasProperty(setting.first))
+                { if (!value[setting.first].isBool()) return fail("Invalid sampler mode schema."); *setting.second = static_cast<bool>(value[setting.first]); }
             if (value.getDynamicObject()->hasProperty("samplerGain"))
             { if (!number(value["samplerGain"])) return fail("Invalid sampler gain schema."); track.samplerGain = static_cast<double>(value["samplerGain"]); }
         }
@@ -340,11 +344,11 @@ juce::Result Storage::write(const Snapshot& snapshot, const juce::File& director
         juce::Array<juce::var> sendAutomation; for (const auto& points : track.sendAutomation) sendAutomation.add(writeAutomation(points));
         juce::Array<juce::var> plugins;
         for (const auto& plugin : track.plugins) plugins.add(object({ {"id", plugin.id}, {"name", plugin.name}, {"description", plugin.description},
-            {"state", plugin.state}, {"instrument", plugin.instrument}, {"bypass", plugin.bypass} }));
+            {"state", plugin.state}, {"instrument", plugin.instrument}, {"bypass", plugin.bypass}, {"sidechain", plugin.sidechain} }));
         juce::Array<juce::var> sends; for (const auto gain : track.sends) sends.add(gain);
         const auto serialized = object({ {"id", track.id}, {"name", track.name}, {"gain", track.gain}, {"mute", track.mute},
             {"midi", track.midi}, {"sample", track.sample}, {"sampleOffset", track.sampleOffset},
-            {"sampleDuration", track.sampleDuration}, {"rootNote", track.rootNote}, {"sampler", track.sampler}, {"samplerGain", track.samplerGain}, {"samplerBypass", track.samplerBypass}, {"inputEnabled", track.inputEnabled}, {"outputEnabled", track.outputEnabled}, {"outputTrack", track.outputTrack}, {"monitor", track.monitor}, {"midiChannel", track.midiChannel}, {"armed", track.armed}, {"height", track.height}, {"folded", track.folded}, {"annotation", track.annotation}, {"color", track.color}, {"group", track.group}, {"groupCollapsed", track.groupCollapsed}, {"parentGroup", track.parentGroup}, {"returnIndex", track.returnIndex}, {"sends", juce::var(sends)}, {"solo", track.solo}, {"plugins", plugins}, {"pan", track.pan}, {"muteAutomation", writeAutomation(track.muteAutomation)}, {"sendAutomation", sendAutomation}, {"volumeAutomation", volumeAutomation}, {"panAutomation", panAutomation} });
+            {"sampleDuration", track.sampleDuration}, {"rootNote", track.rootNote}, {"sampler", track.sampler}, {"samplerOneShot", track.samplerOneShot}, {"samplerLoop", track.samplerLoop}, {"samplerGain", track.samplerGain}, {"samplerBypass", track.samplerBypass}, {"inputEnabled", track.inputEnabled}, {"outputEnabled", track.outputEnabled}, {"outputTrack", track.outputTrack}, {"monitor", track.monitor}, {"midiChannel", track.midiChannel}, {"armed", track.armed}, {"height", track.height}, {"folded", track.folded}, {"annotation", track.annotation}, {"color", track.color}, {"group", track.group}, {"groupCollapsed", track.groupCollapsed}, {"parentGroup", track.parentGroup}, {"returnIndex", track.returnIndex}, {"sends", juce::var(sends)}, {"solo", track.solo}, {"plugins", plugins}, {"pan", track.pan}, {"muteAutomation", writeAutomation(track.muteAutomation)}, {"sendAutomation", sendAutomation}, {"volumeAutomation", volumeAutomation}, {"panAutomation", panAutomation} });
         if (track.id == "master") master = serialized; else tracks.add(serialized);
     }
     for (const auto& asset : snapshot.project.assets)

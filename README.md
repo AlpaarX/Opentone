@@ -18,9 +18,34 @@ A native desktop audio workstation built with C++17 and JUCE. In active developm
 
 Features include audio and MIDI tracks, microphone and MIDI recording, a piano
 roll, built-in instruments and effects, AU/VST3 effects and instruments, a mixer, arrangement
-looping, and volume/pan automation. Master supports its own effect chain.
+looping, and volume/pan automation. Master is the same output track in Arrangement and Mixer; its volume controls the
+combined track and return mix. Cue controls library previews and the metronome.
+Master supports its own effect chain.
 
 Audio import supports WAV, AIFF, FLAC and MP3. VST2 is not enabled.
+
+Opentone starts with a blank project.
+
+## Optional demo
+
+**House 4 — Keijiro Takahashi** is an eight-bar [public Ableton Live MIDI sketch](https://github.com/keijiro/music/tree/master/Sketches/House%204%20Project).
+It uses three native Operator synth instances for chords, bass and kick, nested
+drum racks, Note Length, Dynamic Tube, Saturator and a kick-sidechained compressor.
+The local MIDI-only adaptation omits two recorded Vengeance drum-loop tracks
+whose samples are absent from the public repository, and omits unused Session clips.
+The demo has no recorded audio clips, external VST/AU devices, or rendered stems.
+Press **Space** to play the loop. MIDI notes and native device controls remain editable.
+Opentone implements its own DSP; this is not a verified sound-identical Live emulation.
+
+The author's repository specifies **private use only**. The set is installed
+outside this repository and must not be bundled with Opentone releases.
+Run `python3 tools/install_demo.py` to download the reviewed set and prepare the
+MIDI-only adaptation. It installs under the JUCE user application data directory
+(`~/.config` on Linux, `~/Library` on macOS): `Opentone/Demo/House 4/House 4.als`.
+The installed local adaptation repairs two kick receive-note mappings to 36/60;
+the downloaded original is retained alongside it as `House 4.original.als`.
+Open the installed set manually to try it. **File → New** creates a blank project.
+Save a copy to keep edits.
 
 ## Build and run
 
@@ -71,15 +96,49 @@ for JUCE and other bundled components.
 
 - **FM Synth:** four operators, eight routings, per-operator waves/ratio/ADSR,
   feedback and filtering; 16 voices with live pitch bend and sustain.
+- **Wavetable Synth:** three banks with four morphable frames each, scan modulation,
+  dual detuned oscillators, ADSR and filtering; 16 voices with pitch bend and sustain.
+- **Operator:** four-operator synthesis with per-operator fixed frequency, phase and
+  velocity response, plus per-voice filter and pitch envelopes; 20 factory presets.
+  A/B/C/D select oscillator controls; A+/B+/C+/D+ select tuning controls.
+- **Dynamic Tube:** three saturation curves, drive, output, bias, envelope follower,
+  attack/release, tone and dry/wet with 2× oversampling.
+- **Note Length:** timed or tempo-synced MIDI note gates before plug-in instruments. Imported drum racks retain
+  nested native chains and expose their device editors in tabs; rack creation is
+  currently available through Live import.
 - **Reverb:** size, damping, stereo width, pre-delay, freeze and dry/wet.
 - **Delay:** tempo-sync divisions or milliseconds, feedback, filtering and ping-pong.
+- **Saturator:** eight curves (Analog Clip, Soft Sine, Bass Shaper, Medium Curve,
+  Hard Curve, Sinoid Fold, Digital Clip, Waveshaper), Bass threshold, six Waveshaper
+  controls, Color pre/inverse-post filters with draggable EQ handles, post Soft/Hard
+  Clip, Pre-DC Filter, Hi-Quality (4× oversampling), Drive/Output and Dry/Wet.
+  The curve display shows input level; Color and Waveshaper tabs expose advanced
+  controls. Hi-Quality and Pre-DC Filter are also available by right-clicking the
+  display. Settings save with the project. These are original DSP curves inspired
+  by Live 12's feature set, not a sample-identical Ableton emulation. Oversampling
+  latency is aligned within Dry/Wet; parallel tracks still lack host compensation.
 - **Compressor:** stereo-linked threshold, ratio, attack/release, soft knee, makeup and mix.
 - **Limiter:** stereo-linked sample-peak ceiling, input gain and release.
 - **Parametric EQ:** eight switchable bell/shelf/pass/notch bands; drag nodes for
   frequency/gain and scroll over the graph for Q.
 
+Single-click a sound in the Sounds library or a linked sample folder to audition
+it. Single-click a factory instrument preset to hear one note. Synth presets play
+C4 held for half a second, with up to three seconds of sound; Sampler presets play
+their sampled note. A new click replaces the current preview; Escape in the browser
+stops it. Preview volume follows Cue level; auditioning does not modify the project.
+Double-click and drag keep loading sounds and presets as usual.
+
 Find them under Instruments or Effects. Controls appear directly in Device View,
-including on Master for effects. Device settings save with the project.
+including on Master for effects. Sampler, FM Synth and Wavetable Synth each include
+20 factory presets. Click the arrow to the left of an instrument in the browser to
+expand its presets, then double-click a preset or drag it onto a MIDI track. Loading
+a preset onto the same instrument updates its sound. Presets also appear in search
+results. Device View shows the wavetable shape, the selected FM operator's wave, or
+Sampler's audio waveform; built-in controls stay embedded in Device View.
+Sampler presets are generated sounds (keys, plucks, basses, pads and percussion),
+with their WAV audio copied into the project; sustained samples play to their end.
+Preset selection and device settings save with the project.
 
 ### Return tracks and Live Set import
 
@@ -139,6 +198,11 @@ hierarchy and mixer routing; unsupported Live devices still appear in import not
 
 Sampler's waveform displays its active audio position during MIDI playback,
 keyboard/controller input, and note audition, including waveform zoom/pan.
+Drag the waveform's start/end poles to choose the playable region; each drag can
+be undone. With waveform focus, Left/Right nudges Start by one sample and
+Shift+Left/Right nudges End. The controls to the left select One-shot (play the
+region through after note release) or Loop (repeat the region while a note is
+held). With both off, note release stops playback. These modes save with projects.
 
 Missing/unreadable audio remains visible in clips and Sampler with its filename.
 Failed plug-ins stay in their device chain as unavailable cards. ALS imports also

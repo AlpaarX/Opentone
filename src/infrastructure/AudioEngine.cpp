@@ -46,15 +46,29 @@ struct AudioEngine::Voice
         void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override
         {
             jassert(!AudioEngine::isRendering());
+            if (loopEnd > loopStart)
+            {
+                int written = 0;
+                while (written < info.numSamples)
+                {
+                    if (position >= loopEnd) position = loopStart + (position - loopStart) % (loopEnd - loopStart);
+                    const auto count = static_cast<int>(std::min<juce::int64>(info.numSamples - written, loopEnd - position));
+                    jassert(count > 0 && position >= loopStart && position < loopEnd);
+                    if (!reader->read(info.buffer, info.startSample + written, count, position, true, true)) failed = true;
+                    position += count; written += count;
+                }
+                return;
+            }
             if (!reader->read(info.buffer, info.startSample, info.numSamples, position, true, true)) failed = true;
             position += info.numSamples;
         }
         std::unique_ptr<juce::AudioFormatReader> reader;
         juce::int64 position = 0;
+        juce::int64 loopStart = 0, loopEnd = 0;
         bool failed = false;
     };
     Voice(const Clip& clipIn, const Asset& asset, const juce::File& file, double rateIn,
-          juce::AudioFormatReader* reader, double pitchIn = 1, double gainIn = 1, bool midiIn = false, double repeat = 0, double gateFrom = -1, double gateTo = -1, juce::AudioFormatReader* secondReader = nullptr, double globalStart = 0, double globalEnd = 0, const MidiNote* expressionIn = nullptr)
+          juce::AudioFormatReader* reader, double pitchIn = 1, double gainIn = 1, bool midiIn = false, double repeat = 0, double gateFrom = -1, double gateTo = -1, juce::AudioFormatReader* secondReader = nullptr, double globalStart = 0, double globalEnd = 0, const MidiNote* expressionIn = nullptr, double sampleLoopStart = 0, double sampleLoopLength = 0)
         : clip(clipIn), path(file), rate(rateIn), pitch(pitchIn), gain(gainIn), midi(midiIn), source(reader), resampler(&source, false, 2), scratch(2, chunk)
     {
         if (expressionIn) { expression = *expressionIn; hasExpression = true; }
@@ -64,18 +78,25 @@ struct AudioEngine::Voice
         windowStart = gateFrom >= 0 ? static_cast<juce::int64>(std::llround(gateFrom * rate)) : start;
         end = static_cast<juce::int64>(std::llround((gateTo >= 0 ? gateTo : clip.start + clip.duration) * rate));
         sourceRate = asset.sampleRate;
+        if (sampleLoopLength > 0)
+        { source.loopStart = static_cast<juce::int64>(std::llround(sampleLoopStart * sourceRate));
+          source.loopEnd = std::min(asset.length, std::max(source.loopStart + 1, static_cast<juce::int64>(std::llround((sampleLoopStart + sampleLoopLength) * sourceRate)))); }
         resampler.setResamplingRatio(sourceRate * pitch / rate);
         resampler.prepareToPlay(chunk, rate);
         if (secondReader)
         {
             loopStart = static_cast<juce::int64>(std::llround(globalStart * rate)); loopEnd = static_cast<juce::int64>(std::llround(globalEnd * rate));
             alternate = std::make_unique<Source>(secondReader);
+            alternate->loopStart = source.loopStart; alternate->loopEnd = source.loopEnd;
             alternateResampler = std::make_unique<juce::ResamplingAudioSource>(alternate.get(), false, 2);
             alternateResampler->setResamplingRatio(sourceRate * pitch / rate); alternateResampler->prepareToPlay(chunk, rate);
         }
     }
-    bool matches(const Clip& value, const juce::File& file, double pitchIn, double gainIn, bool midiIn, double repeat, double gateFrom, double gateTo, double globalStart, double globalEnd, const MidiNote* expressionIn) const
-    { return loopStart == static_cast<juce::int64>(std::llround(globalStart * rate)) && loopEnd == static_cast<juce::int64>(std::llround(globalEnd * rate)) && period == (repeat > 0 ? std::max<juce::int64>(1, static_cast<juce::int64>(std::llround(repeat * rate))) : 0)
+    bool matches(const Clip& value, const juce::File& file, double pitchIn, double gainIn, bool midiIn, double repeat, double gateFrom, double gateTo, double globalStart, double globalEnd, const MidiNote* expressionIn, double sampleLoopStart, double sampleLoopLength) const
+    { return source.loopStart == static_cast<juce::int64>(std::llround(sampleLoopStart * sourceRate))
+          && (source.loopEnd > source.loopStart) == (sampleLoopLength > 0)
+          && (sampleLoopLength <= 0 || source.loopEnd == std::min(source.reader->lengthInSamples, std::max(source.loopStart + 1, static_cast<juce::int64>(std::llround((sampleLoopStart + sampleLoopLength) * sourceRate)))))
+          && loopStart == static_cast<juce::int64>(std::llround(globalStart * rate)) && loopEnd == static_cast<juce::int64>(std::llround(globalEnd * rate)) && period == (repeat > 0 ? std::max<juce::int64>(1, static_cast<juce::int64>(std::llround(repeat * rate))) : 0)
           && windowStart == (gateFrom >= 0 ? static_cast<juce::int64>(std::llround(gateFrom * rate)) : start)
           && end == static_cast<juce::int64>(std::llround((gateTo >= 0 ? gateTo : value.start + value.duration) * rate))
           && hasExpression == (expressionIn != nullptr) && (!hasExpression || expression == *expressionIn)
@@ -151,6 +172,15 @@ struct AudioEngine::Voice
           if (clip.fadeIn > 0) level *= juce::jlimit(0.0, 1.0, elapsed / clip.fadeIn);
           if (clip.fadeOut > 0) level *= juce::jlimit(0.0, 1.0, (clip.duration - elapsed) / clip.fadeOut); }
         left = block.data[0][offset] * static_cast<float>(level); right = block.data[1][offset] * static_cast<float>(level); return !block.failed;
+    }
+    double samplePosition(juce::int64 frame) const
+    {
+        const auto time = mappedFrame(frame);
+        const auto position = clip.offset + static_cast<double>(time - onsetAt(time)) / rate * pitch;
+        if (source.loopEnd <= source.loopStart) return position;
+        const auto begin = static_cast<double>(source.loopStart) / sourceRate;
+        const auto length = static_cast<double>(source.loopEnd - source.loopStart) / sourceRate;
+        return begin + std::fmod(std::max(0.0, position - begin), length);
     }
     double expressionVelocity(juce::int64 onset, juce::int64 actual) const
     { const auto cycle = period > 0 ? static_cast<uint64_t>((onset - start) / period) : 0;
@@ -355,7 +385,7 @@ bool AudioEngine::previewNote(const Track& track, const Asset& asset, const juce
     {
         auto& slot = previews[index]; int idle = 0;
         if (!slot.state.compare_exchange_strong(idle, 1)) continue;
-        slot.track = track.id; slot.note = note; slot.held = held; slot.release.store(false); slot.position.store(0);
+        slot.track = track.id; slot.note = note; slot.held = held; slot.oneShot = track.samplerOneShot; slot.release.store(false); slot.position.store(0);
         auto& control = controls[track.id];
         if (!control) { control = std::make_shared<Control>(); control->bus = plugins.bus(track.id); control->target.store(track.mute ? 0.0f : static_cast<float>(track.gain));
           control->samplerTarget.store(track.samplerBypass ? 0.0f : static_cast<float>(track.samplerGain)); }
@@ -368,7 +398,7 @@ bool AudioEngine::previewNote(const Track& track, const Asset& asset, const juce
 void AudioEngine::releaseEditPreviews(const juce::String& track)
 { plugins.release(track, -1, true); for (auto& slot : previews) if (slot.state.load() != 0 && slot.track == track && !slot.held) slot.release.store(true); }
 void AudioEngine::releasePreview(const juce::String& track, int note)
-{ plugins.release(track, note); for (auto& slot : previews) if (slot.state.load() != 0 && slot.track == track && (note < 0 || slot.note == note)) slot.release.store(true); }
+{ plugins.release(track, note); for (auto& slot : previews) if (slot.state.load() != 0 && slot.track == track && (note < 0 || (slot.note == note && !slot.oneShot))) slot.release.store(true); }
 double AudioEngine::samplerPosition(const juce::String& id) const
 { const auto found = controls.find(id); return found == controls.end() ? -1 : found->second->samplerCursor.load(); }
 std::bitset<128> AudioEngine::activeNotes(const juce::String& track) const
@@ -420,14 +450,14 @@ std::unique_ptr<AudioEngine::Arrangement> AudioEngine::prepare(const Request& re
     for (const auto& pair : request.controls) arrangement->controls.push_back(pair.second);
     const auto globalStart = request.snapshot.project.loopEnabled ? request.snapshot.project.loopStart : 0;
     const auto globalEnd = request.snapshot.project.loopEnabled ? request.snapshot.project.loopEnd : 0;
-    const auto addVoice = [&](const Clip& clip, const Asset& asset, double pitch, double gain, bool midi, double repeat = 0, double gateFrom = -1, double gateTo = -1, const MidiNote* expression = nullptr)
+    const auto addVoice = [&](const Clip& clip, const Asset& asset, double pitch, double gain, bool midi, double repeat = 0, double gateFrom = -1, double gateTo = -1, const MidiNote* expression = nullptr, double sampleLoopStart = 0, double sampleLoopLength = 0)
     {
         if (asset.missing) return;
         const auto file = request.snapshot.directory.getChildFile(asset.path);
         auto control = request.controls.find(clip.track); if (control == request.controls.end()) return;
         std::shared_ptr<Voice> voice;
         if (!request.seek && base && base->generation == arrangement->generation)
-            for (const auto& entry : base->voices) if (entry.voice->matches(clip, file, pitch, gain, midi, repeat, gateFrom, gateTo, globalStart, globalEnd, expression)) { voice = entry.voice; break; }
+            for (const auto& entry : base->voices) if (entry.voice->matches(clip, file, pitch, gain, midi, repeat, gateFrom, gateTo, globalStart, globalEnd, expression, sampleLoopStart, sampleLoopLength)) { voice = entry.voice; break; }
         const bool reused = voice != nullptr;
         if (!voice)
         {
@@ -435,7 +465,7 @@ std::unique_ptr<AudioEngine::Arrangement> AudioEngine::prepare(const Request& re
             if (!reader) { setError("Could not prepare " + file.getFileName()); return; }
             auto* secondReader = globalEnd > globalStart ? formats.createReaderFor(file) : nullptr;
             if (globalEnd > globalStart && !secondReader) { delete reader; setError("Could not prepare loop audio"); return; }
-            voice = std::make_shared<Voice>(clip, asset, file, rateIn, reader, pitch, gain, midi, repeat, gateFrom, gateTo, secondReader, globalStart, globalEnd, expression);
+            voice = std::make_shared<Voice>(clip, asset, file, rateIn, reader, pitch, gain, midi, repeat, gateFrom, gateTo, secondReader, globalStart, globalEnd, expression, sampleLoopStart, sampleLoopLength);
         }
         arrangement->voices.push_back({ std::move(voice), control->second, reused });
     };
@@ -465,12 +495,15 @@ std::unique_ptr<AudioEngine::Arrangement> AudioEngine::prepare(const Request& re
                 frameAt(clip.start), frameAt(clipEnd), static_cast<float>(note.velocity), note, static_cast<juce::uint32>((clip.id + ":" + juce::String(static_cast<int>(index))).hashCode()), pattern->period > 0 ? 0 : from - pattern->onset });
             if (!asset || !track->sampler || track->samplerBypass) continue;
             const auto pitch = std::pow(2.0, (note.pitch - track->rootNote) / 12.0);
-            const auto sampleEnd = pattern->onset + track->sampleDuration / pitch;
-            if (pattern->period <= 0 && sampleEnd <= from) continue;
+            const auto sampleLength = track->sampleDuration / pitch;
+            const auto sampleEnd = pattern->onset + sampleLength;
+            if (!track->samplerLoop && pattern->period <= 0 && sampleEnd <= from) continue;
+            const auto remaining = pattern->period > 0 ? sampleLength : sampleEnd - from;
+            const auto duration = track->samplerLoop ? length : track->samplerOneShot ? remaining : std::min(length, remaining);
             Clip played { clip.id + ":" + juce::String(static_cast<int>(index)), clip.track, asset->id,
-                onset, track->sampleOffset + (pattern->period > 0 ? 0 : (from - pattern->onset) * pitch),
-                std::min(length, pattern->period > 0 ? track->sampleDuration / pitch : sampleEnd - from) };
-            addVoice(played, *asset, pitch, 1, true, pattern->period, clip.start, clipEnd, &note);
+                onset, track->sampleOffset + (pattern->period > 0 ? 0 : (from - pattern->onset) * pitch), duration };
+            addVoice(played, *asset, pitch, 1, true, pattern->period, clip.start, clipEnd, &note,
+                track->samplerLoop ? track->sampleOffset : 0, track->samplerLoop ? track->sampleDuration : 0);
         }
     }
 
@@ -500,9 +533,13 @@ void AudioEngine::workerLoop()
             auto* reader = formats.createReaderFor(request.file);
             if (!reader) { slot.state.store(0, std::memory_order_release); continue; }
             const auto pitch = std::pow(2.0, (request.note - request.track.rootNote) / 12.0);
-            Clip clip { "preview", request.track.id, request.asset.id, 0, request.track.sampleOffset,
-                std::min(request.track.sampleDuration / pitch, request.held ? request.track.sampleDuration / pitch : 0.25) };
-            slot.voice = std::make_unique<Voice>(clip, request.asset, request.file, sampleRate.load(), reader, pitch, request.velocity, true);
+            const auto sampleLength = request.track.sampleDuration / pitch;
+            const auto duration = request.track.samplerLoop && request.held
+                ? static_cast<double>(std::numeric_limits<juce::int64>::max() / 4) / sampleRate.load()
+                : request.track.samplerOneShot || request.held ? sampleLength : std::min(sampleLength, 0.25);
+            Clip clip { "preview", request.track.id, request.asset.id, 0, request.track.sampleOffset, duration };
+            slot.voice = std::make_unique<Voice>(clip, request.asset, request.file, sampleRate.load(), reader, pitch, request.velocity, true,
+                0, -1, -1, nullptr, 0, 0, nullptr, request.track.samplerLoop ? request.track.sampleOffset : 0, request.track.samplerLoop ? request.track.sampleDuration : 0);
             slot.control = request.control;
             slot.voice->initialise(0); slot.level = 0; slot.releaseLeft = 0;
         }
@@ -794,7 +831,7 @@ void AudioEngine::renderPlayback(float* const* output, int channels, int samples
     {
         const auto time = entry.voice->mappedFrame(frame - 1), onset = entry.voice->onsetAt(time);
         if (time >= entry.voice->windowStart && time >= onset && time < entry.voice->end && time < onset + entry.voice->noteLength && entry.voice->expressionVelocity(onset, frame - 1) > 0)
-        { const auto position = entry.voice->clip.offset + static_cast<double>(time - onset) / entry.voice->rate * entry.voice->pitch;
+        { const auto position = entry.voice->samplePosition(frame - 1);
           if (position < entry.control->samplerEnd.load()) entry.control->samplerCursor.store(position); }
     }
     clock.store(frame);
@@ -831,7 +868,7 @@ void AudioEngine::renderPreviews(float* const* output, int channels, int samples
         }
         slot.position.store(frame);
         if (!done && slot.control->samplerTarget.load() > 0)
-        { const auto position = voice->clip.offset + static_cast<double>(frame) / voice->rate * voice->pitch;
+        { const auto position = voice->samplePosition(frame);
           if (position < slot.control->samplerEnd.load()) slot.control->samplerCursor.store(position); }
         if (!done && !slot.release.load()) slot.control->markNote(slot.note);
         slot.control->publishNotes();

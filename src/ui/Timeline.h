@@ -13,6 +13,7 @@ public:
     void paint(juce::Graphics&) override;
     void mouseDown(const juce::MouseEvent&) override;
     void mouseDrag(const juce::MouseEvent&) override;
+    void mouseUp(const juce::MouseEvent&) override;
     void refresh();
     void tick();
     void deleteSelection();
@@ -31,9 +32,11 @@ private:
     class BeatRuler;
     class Scroll : public juce::Viewport
     { public: std::function<void(juce::Rectangle<int>)> onScroll;
+      std::function<void(const juce::MouseEvent&, float)> onZoom;
       juce::Viewport* wheelTarget = nullptr;
       void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
       { if (wheelTarget) wheelTarget->mouseWheelMove(event.getEventRelativeTo(wheelTarget), wheel);
+        else if (onZoom && (event.mods.isCommandDown() || event.mods.isCtrlDown())) onZoom(event, std::exp(wheel.deltaY * 2));
         else juce::Viewport::mouseWheelMove(event, wheel); }
       void visibleAreaChanged(const juce::Rectangle<int>& bounds) override { if (onScroll) onScroll(bounds); } };
     EditorPresenter& presenter;
@@ -50,5 +53,7 @@ private:
     std::unique_ptr<BeatRuler> beatRuler;
     juce::TextButton automationButton {"Automation"}, automationLock {"Lock"}, setLocator {"Set"}, previousLocator {"Previous"}, nextLocator {"Next"};
     bool restoring = true; int fixedBraceHeight = 18;
+    bool panning = false;
+    juce::Point<int> panStart, panScroll;
 };
 }

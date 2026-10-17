@@ -48,8 +48,9 @@ private:
     EditorPresenter& presenter;
     juce::String trackId, clipId;
     juce::TextButton load { "Load" }, clips { "Use clip" };
-    juce::Label source, rootLabel, volumeLabel, startLabel, endLabel;
-    juce::Slider root, volume, sampleStart, sampleEnd;
+    juce::Label source, rootLabel, volumeLabel;
+    juce::Slider root, volume;
+    juce::ToggleButton oneShot {"One-shot"}, sampleLoop {"Loop"};
     juce::ToggleButton loopToggle {"Loop"};
     juce::Label loopStartLabel, loopLengthLabel, clipLengthLabel;
     juce::Slider loopStart, loopLength, clipLength, horizontalZoom, verticalZoom;

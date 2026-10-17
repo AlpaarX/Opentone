@@ -33,6 +33,7 @@ EditorPresenter::EditorPresenter(ProjectSession& model, Storage& files, AudioEng
         if (snapshot.generation != generation) { generation = snapshot.generation; engine.replace(snapshot); }
         else engine.submit(snapshot, structural, !recording());
     };
+    libraryPlayer.setSource(&libraryTransport); engine.devices.addAudioCallback(&libraryPlayer);
     session.addChangeListener(this); engine.plugins.addChangeListener(this);
     engine.devices.addMidiInputDeviceCallback({}, this); refreshMidiInputs();
     startTimerHz(30);
@@ -40,11 +41,14 @@ EditorPresenter::EditorPresenter(ProjectSession& model, Storage& files, AudioEng
 }
 EditorPresenter::~EditorPresenter()
 {
+    stopLibraryPreview(); engine.devices.removeAudioCallback(&libraryPlayer);
+    libraryPreviewPool.removeAllJobs(true, -1); libraryPlayer.setSource(nullptr); libraryReadAhead.stopThread(-1);
     engine.devices.removeMidiInputDeviceCallback({}, this); cancelPendingUpdate();
     stopTimer(); finishRecording(); releaseControllerNotes(); storage.cancel(); session.removeChangeListener(this); engine.plugins.removeChangeListener(this); session.onEdit = nullptr;
 }
 void EditorPresenter::changeListenerCallback(juce::ChangeBroadcaster*)
 {
+    libraryTransport.setGain(static_cast<float>(project().cueGain));
     for (int i = state.selectedClips.size(); --i >= 0;)
         if (!findId(project().clips, state.selectedClips[i])) state.selectedClips.remove(i);
     for (int i = state.selectedTracks.size(); --i >= 0;) if (!findTrack(project(), state.selectedTracks[i])) state.selectedTracks.remove(i);
@@ -282,7 +286,11 @@ void EditorPresenter::pasteTrack()
       else if (!findTrack(project(), track.parentGroup)) track.parentGroup.clear();
       for (auto& plugin : track.plugins) plugin.id = newId(); }
     auto clips = trackClips;
-    for (auto& track : tracks) if (ids.count(track.outputTrack)) track.outputTrack = ids[track.outputTrack];
+    for (auto& track : tracks)
+    { if (ids.count(track.outputTrack)) track.outputTrack = ids[track.outputTrack];
+      for (auto& plugin : track.plugins)
+      { if (ids.count(plugin.sidechain)) plugin.sidechain = ids[plugin.sidechain];
+        else if (plugin.sidechain.isNotEmpty() && !findTrack(project(), plugin.sidechain)) plugin.sidechain.clear(); } }
     for (auto& clip : clips) { clip.id = newId(); clip.track = ids[clip.track]; }
     if (session.insertClips(clips, tracks)) selectTrack(root);
     else message("Could not paste track; its audio is no longer in this project.");
@@ -290,7 +298,7 @@ void EditorPresenter::pasteTrack()
 void EditorPresenter::previewNotes(const juce::String& id, const std::vector<MidiNote>& notes)
 {
     const auto* track = findId(project().tracks, id); if (!track) return;
-    if (!track->plugins.empty() && track->plugins.front().instrument)
+    if (std::any_of(track->plugins.begin(), track->plugins.end(), [](const auto& plugin) { return plugin.instrument; }))
     { engine.plugins.release(id, -1, true); std::bitset<128> sounded;
       for (const auto& note : notes) if (!sounded.test(static_cast<size_t>(note.pitch)))
       { sounded.set(static_cast<size_t>(note.pitch)); engine.plugins.preview(id, note.pitch, note.velocity, false, false); }
@@ -310,17 +318,147 @@ bool EditorPresenter::capturePluginStates(bool force)
     if (!states.empty() && !session.pluginStates(states)) { message("Could not store plug-in settings; a plug-in state exceeds 16 MB."); return false; }
     return true;
 }
+void EditorPresenter::stopLibraryPreview()
+{
+    ++*libraryPreviewEpoch;
+    libraryTransport.stop(); libraryTransport.setSource(nullptr); librarySource.reset();
+}
+void EditorPresenter::previewLibraryItem(const juce::String& description)
+{
+    stopLibraryPreview();
+    juce::File file; juce::String instrument; int preset = -1;
+    if (description.startsWith("sample:")) file = juce::File(description.substring(7));
+    else if (description.startsWith("asset:"))
+    {
+        const auto* asset = findId(project().assets, description.substring(6));
+        if (!asset || asset->missing) { message("This sound's audio file is missing."); return; }
+        file = mediaDirectory().getChildFile(asset->path);
+    }
+    else if (description.startsWith("device:preset:"))
+    {
+        const auto rest = description.substring(14), index = rest.upToFirstOccurrenceOf(":", false, false);
+        if (index.isEmpty() || index.length() > 2 || !index.containsOnly("0123456789") || !rest.containsChar(':')) return;
+        preset = index.getIntValue(); const auto identifier = rest.fromFirstOccurrenceOf(":", false, false);
+        if (identifier == "builtin:sampler") instrument = identifier;
+        else for (const auto& plugin : engine.plugins.availablePlugins())
+            if (plugin.createIdentifierString() == identifier && plugin.pluginFormatName == "Opentone" && plugin.isInstrument)
+            { instrument = plugin.fileOrIdentifier; break; }
+        if (instrument.isEmpty() || preset >= builtinPresetNames(instrument).size()) return;
+    }
+    else return;
+    if (!engine.devices.getCurrentAudioDevice()) { message("Choose an audio output in Settings > Audio to preview sounds."); return; }
+    if (!libraryReadAhead.isThreadRunning() && !libraryReadAhead.startThread())
+    { message("Could not start library audio preview."); return; }
+    const auto epoch = libraryPreviewEpoch; const auto request = epoch->load(); const auto directory = storage.workspace();
+    juce::WeakReference<EditorPresenter> owner(this);
+    libraryPreviewPool.addJob(std::function<void()>([owner, epoch, request, file, instrument, preset, directory]() mutable
+    {
+        if (epoch->load() != request) return;
+        std::shared_ptr<juce::PositionableAudioSource> source; double rate = 48000; juce::String error;
+        if (instrument == "builtin:sampler")
+        {
+            file = directory.getChildFile("Library Previews/Sampler " + juce::String(preset) + ".wav");
+            if (!file.existsAsFile())
+            { const auto result = writeSamplerPreset(preset, file); if (result.failed()) error = result.getErrorMessage(); }
+        }
+        if (instrument.isNotEmpty() && instrument != "builtin:sampler")
+        {
+            auto synth = createBuiltinPlugin(instrument);
+            if (!synth || preset < 0 || preset >= synth->getNumPrograms()) error = "Could not load preset preview.";
+            else
+            {
+                synth->setCurrentProgram(preset); synth->setRateAndBufferSizeDetails(rate, 256); synth->prepareToPlay(rate, 256);
+                // shortcut: auditions cap the release tail at three seconds, extend when longer preset previews are needed.
+                juce::AudioBuffer<float> audio(2, static_cast<int>(rate * 3)); audio.clear();
+                const auto noteOff = static_cast<int>(rate * 0.5);
+                for (int offset = 0; offset < audio.getNumSamples(); offset += 256)
+                {
+                    if (epoch->load() != request) { synth->releaseResources(); return; }
+                    const auto count = std::min(256, audio.getNumSamples() - offset);
+                    juce::AudioBuffer<float> block(audio.getArrayOfWritePointers(), 2, offset, count); juce::MidiBuffer midi;
+                    if (offset == 0) midi.addEvent(juce::MidiMessage::noteOn(1, 60, 0.8f), 0);
+                    if (noteOff >= offset && noteOff < offset + count) midi.addEvent(juce::MidiMessage::noteOff(1, 60), noteOff - offset);
+                    synth->processBlock(block, midi);
+                }
+                synth->releaseResources();
+                bool finite = true;
+                for (int c = 0; c < audio.getNumChannels(); ++c) for (int i = 0; i < audio.getNumSamples(); ++i)
+                    finite = finite && std::isfinite(audio.getSample(c, i));
+                jassert(finite);
+                if (!finite) error = "Preset preview produced invalid audio.";
+                else
+                {
+                    audio.applyGainRamp(0, 240, 0, 1); audio.applyGainRamp(audio.getNumSamples() - 960, 960, 1, 0);
+                    source = std::make_shared<juce::MemoryAudioSource>(audio, true);
+                }
+            }
+        }
+        else if (error.isEmpty())
+        {
+            juce::AudioFormatManager formats; formats.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
+            if (!reader || !std::isfinite(reader->sampleRate) || reader->sampleRate <= 0 || reader->sampleRate > 1000000
+                || reader->lengthInSamples <= 0 || reader->numChannels < 1 || reader->numChannels > 2)
+                error = "Could not preview this sound. Choose a readable mono or stereo audio file.";
+            else { rate = reader->sampleRate; source = std::make_shared<juce::AudioFormatReaderSource>(reader.release(), true); }
+        }
+        if (epoch->load() != request) return;
+        juce::MessageManager::callAsync([owner, epoch, request, source, rate, error]
+        {
+            if (epoch->load() != request || !owner) return;
+            if (error.isNotEmpty()) { owner->message(error); return; }
+            if (!source) return;
+            owner->librarySource = source;
+            owner->libraryTransport.setSource(source.get(), 32768, &owner->libraryReadAhead, rate);
+            owner->libraryTransport.setGain(static_cast<float>(owner->project().cueGain));
+            owner->libraryTransport.setPosition(0); owner->libraryTransport.start();
+        });
+    }));
+}
+
 void EditorPresenter::addDevice(const juce::String& identifier, juce::String track)
 {
+    auto device = identifier; int preset = -1;
+    if (device.startsWith("preset:"))
+    {
+        const auto rest = device.substring(7), index = rest.upToFirstOccurrenceOf(":", false, false);
+        if (index.isEmpty() || index.length() > 2 || !index.containsOnly("0123456789") || !rest.containsChar(':')) return;
+        preset = index.getIntValue(); device = rest.fromFirstOccurrenceOf(":", false, false);
+    }
     const bool createTrack = track.isEmpty(); if (createTrack) track = newId();
     bool added = false;
-    if (identifier == "builtin:sampler") added = session.addSampler(track, createTrack);
+    if (device == "builtin:sampler")
+    {
+        if (preset >= samplerPresetNames().size()) return;
+        const bool ownGesture = preset >= 0 && !session.gesturing(); if (ownGesture) session.beginGesture();
+        const auto* target = findTrack(project(), track);
+        added = target && target->sampler ? true : session.addSampler(track, createTrack);
+        if (added && preset >= 0) loadSamplerPreset(track, preset);
+        if (ownGesture) session.endGesture(false);
+    }
     else
     {
-        for (const auto& description : engine.plugins.availablePlugins()) if (description.createIdentifierString() == identifier)
+        for (const auto& description : engine.plugins.availablePlugins()) if (description.createIdentifierString() == device)
         {
-            auto xml = description.createXml();
-            if (xml) added = session.addPlugin(track, { newId(), description.name, xml->toString(), {}, description.isInstrument, false }, createTrack);
+            if (preset >= 0)
+            {
+                if (description.pluginFormatName != "Opentone" || preset >= builtinPresetNames(description.fileOrIdentifier).size()) return;
+                if (!capturePluginStates(true)) return;
+                auto plugin = builtinPluginModel(description.fileOrIdentifier, {}, preset);
+                if (const auto* target = findTrack(project(), track))
+                    for (const auto& current : target->plugins) if (current.instrument)
+                    {
+                        juce::PluginDescription existing; const auto xml = juce::XmlDocument::parse(current.description);
+                        if (xml && existing.loadFromXml(*xml) && existing.pluginFormatName == "Opentone" && existing.fileOrIdentifier == description.fileOrIdentifier)
+                        { session.pluginStates({{current.id, plugin.state}}); selectTrack(track); return; }
+                    }
+                added = session.addPlugin(track, std::move(plugin), createTrack);
+            }
+            else
+            {
+                auto xml = description.createXml();
+                if (xml) added = session.addPlugin(track, { newId(), description.name, xml->toString(), {}, description.isInstrument, false }, createTrack);
+            }
             break;
         }
     }
@@ -342,7 +480,7 @@ void EditorPresenter::movePlugin(const juce::String& source, const juce::String&
 bool EditorPresenter::previewNote(const juce::String& id, int note, double velocity, bool held)
 {
     const auto* track = findId(project().tracks, id);
-    if (track && !track->plugins.empty() && track->plugins.front().instrument) return engine.plugins.preview(id, note, velocity, held, true);
+    if (track && std::any_of(track->plugins.begin(), track->plugins.end(), [](const auto& plugin) { return plugin.instrument; })) return engine.plugins.preview(id, note, velocity, held, true);
     if (!track || !track->midi || !track->sampler || track->samplerBypass) return false;
     const auto* asset = findId(project().assets, track->sample); if (!asset || asset->missing) return false;
     return engine.previewNote(*track, *asset, mediaDirectory().getChildFile(asset->path), note, velocity, held);
@@ -361,6 +499,21 @@ void EditorPresenter::loadSampler(const juce::String& track, const juce::String&
     const auto destination = track;
     if (!session.loadSampler(destination, asset, offset, duration)) message("Could not load sampler source.");
     else selectTrack(destination);
+}
+void EditorPresenter::loadSamplerPreset(const juce::String& id, int index)
+{
+    const auto destination = id; const auto* track = findTrack(project(), destination);
+    const auto names = samplerPresetNames();
+    if (!track || !track->sampler || index < 0 || index >= names.size()) return;
+    const auto file = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Opentone/Factory Samples").getChildFile(names[index] + ".wav");
+    const auto generated = writeSamplerPreset(index, file);
+    if (generated.failed()) { message(generated.getErrorMessage()); return; }
+    const auto imported = Storage::copyAudio(file, mediaDirectory());
+    if (imported.result.failed()) { message(imported.result.getErrorMessage()); return; }
+    if (!session.loadSampler(destination, imported.asset.id, 0, static_cast<double>(imported.asset.length) / imported.asset.sampleRate, imported.asset, 60))
+    { mediaDirectory().getChildFile(imported.asset.path).deleteFile(); message("Could not load sampler preset."); return; }
+    engine.releasePreview(destination, -1); selectTrack(destination);
 }
 void EditorPresenter::renameTrack(const juce::String& id, const juce::String& name) { session.renameTrack(id, name); }
 void EditorPresenter::deleteTrack(const juce::String& id) { const auto track = id; if (recording()) stop(); if (capturePluginStates(true)) session.deleteTrack(track); }
@@ -840,6 +993,7 @@ void EditorPresenter::guardUnsaved(std::function<void()> action)
 }
 void EditorPresenter::clearPending()
 {
+    stopLibraryPreview();
     requestingMicrophone = false;
     releaseControllerNotes();
     storage.cancel(); ++operation; imports.clear(); busySave = busyOpen = false; pendingImports = 0;

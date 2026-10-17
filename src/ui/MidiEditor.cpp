@@ -325,8 +325,8 @@ class MidiEditor::Waveform final : public juce::Component, private juce::ChangeL
 {
 public:
     explicit Waveform(MidiEditor& editor) : owner(editor), thumbnail(64, formats, cache)
-    { addChildComponent(needle); needle.setInterceptsMouseClicks(false, false); formats.registerBasicFormats(); thumbnail.addChangeListener(this); detail.addChangeListener(this); setTitle("Sample waveform; pinch or Ctrl/Command-scroll to zoom, drag to pan, double click to reset"); }
-    ~Waveform() override { sourceLoader.removeAllJobs(true, -1); detail.removeChangeListener(this); thumbnail.removeChangeListener(this); }
+    { addChildComponent(needle); needle.setInterceptsMouseClicks(false, false); formats.registerBasicFormats(); thumbnail.addChangeListener(this); detail.addChangeListener(this); setWantsKeyboardFocus(true); setTitle("Sample waveform; drag start/end poles to trim; Left/Right adjust start, Shift+Left/Right adjust end; pinch or Ctrl/Command-scroll to zoom, drag waveform to pan, double click to reset zoom"); }
+    ~Waveform() override { finish(true); sourceLoader.removeAllJobs(true, -1); detail.removeChangeListener(this); thumbnail.removeChangeListener(this); }
     void updateNeedle()
     {
         const auto position = owner.presenter.samplerPosition(owner.trackId); const auto area = plot();
@@ -384,13 +384,36 @@ public:
     { if (event.mods.isCtrlDown() || event.mods.isCommandDown()) setZoom(zoom * std::exp(wheel.deltaY * 2), event.position.x);
       else juce::Component::mouseWheelMove(event, wheel); }
     void mouseDown(const juce::MouseEvent& event) override
-    { dragStart = viewStart; downX = event.position.x; panning = event.mods.isLeftButtonDown() && sourceLength() > 0;
-      setMouseCursor(juce::MouseCursor::DraggingHandCursor); }
+    {
+        if (sourceLength() <= 0) return;
+        if (event.mods.isLeftButtonDown()) marker = markerAt(event.position);
+        if (marker >= 0) { grabKeyboardFocus(); owner.presenter.beginGesture(); setMouseCursor(juce::MouseCursor::LeftRightResizeCursor); return; }
+        dragStart = viewStart; downX = event.position.x;
+        panning = event.mods.isLeftButtonDown() || event.mods.isMiddleButtonDown();
+        if (panning) setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+    }
     void mouseDrag(const juce::MouseEvent& event) override
-    { if (!panning || plot().getWidth() < 1) return;
+    { if (marker >= 0 && plot().getWidth() > 0) { moveMarker(viewStart + (event.position.x - plot().getX()) / plot().getWidth() * span()); return; }
+      if (!panning || plot().getWidth() < 1) return;
       viewStart = juce::jlimit(0.0, std::max(0.0, sourceLength() - span()), dragStart - (event.position.x - downX) / plot().getWidth() * span()); dirty = true; repaint(); }
-    void mouseUp(const juce::MouseEvent&) override { panning = false; setMouseCursor(juce::MouseCursor::NormalCursor); }
-    void mouseDoubleClick(const juce::MouseEvent&) override { zoom = 1; viewStart = 0; dirty = true; repaint(); }
+    void mouseUp(const juce::MouseEvent&) override { finish(false); }
+    void mouseMove(const juce::MouseEvent& event) override
+    { setMouseCursor(markerAt(event.position) >= 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor); }
+    void mouseDoubleClick(const juce::MouseEvent&) override { finish(false); zoom = 1; viewStart = 0; dirty = true; repaint(); }
+    void finish(bool cancel)
+    { const bool editing = marker >= 0; marker = -1; panning = false;
+      if (editing) owner.presenter.endGesture(cancel); setMouseCursor(juce::MouseCursor::NormalCursor); }
+    bool keyPressed(const juce::KeyPress& key) override
+    {
+        if (key.getKeyCode() == juce::KeyPress::escapeKey) { finish(true); return true; }
+        if (key.getKeyCode() != juce::KeyPress::leftKey && key.getKeyCode() != juce::KeyPress::rightKey) return false;
+        const auto* track = findTrack(owner.presenter.project(), owner.trackId);
+        const auto* asset = track ? findId(owner.presenter.project().assets, track->sample) : nullptr;
+        if (!asset || asset->missing || asset->sampleRate <= 0 || marker >= 0) return false;
+        marker = key.getModifiers().isShiftDown() ? 1 : 0; owner.presenter.beginGesture();
+        moveMarker(track->sampleOffset + (marker == 1 ? track->sampleDuration : 0) + (key.getKeyCode() == juce::KeyPress::leftKey ? -1 : 1) / asset->sampleRate);
+        finish(false); return true;
+    }
     void paint(juce::Graphics& graphics) override
     {
         graphics.fillAll(uiTone(UiTone::display)); const auto area = plot();
@@ -414,12 +437,12 @@ public:
         const auto from = juce::jlimit(area.getX(), area.getRight(), juce::roundToInt(xAt(track->sampleOffset)));
         const auto to = juce::jlimit(area.getX(), area.getRight(), juce::roundToInt(xAt(track->sampleOffset + track->sampleDuration)));
         graphics.setColour(juce::Colours::black.withAlpha(0.45f)); graphics.fillRect(area.withRight(from)); graphics.fillRect(area.withLeft(to));
-        graphics.setColour(juce::Colours::white.withAlpha(0.65f));
+        graphics.setColour(juce::Colours::white.withAlpha(0.9f));
         for (const auto seconds : { track->sampleOffset, track->sampleOffset + track->sampleDuration })
         { const auto rawX = juce::roundToInt(xAt(seconds)); const auto x = std::min(rawX, area.getRight() - 1);
           if (rawX >= area.getX() && rawX <= area.getRight())
           { graphics.drawVerticalLine(x, static_cast<float>(area.getY()), static_cast<float>(area.getBottom()));
-            juce::Path marker; marker.addTriangle(static_cast<float>(x), static_cast<float>(area.getY()), static_cast<float>(x + (seconds > track->sampleOffset ? -7 : 7)), static_cast<float>(area.getY() + 4), static_cast<float>(x), static_cast<float>(area.getY() + 8)); graphics.fillPath(marker); } }
+            juce::Path pole; pole.addTriangle(static_cast<float>(x), static_cast<float>(area.getY()), static_cast<float>(x + (seconds > track->sampleOffset ? -10 : 10)), static_cast<float>(area.getY() + 5), static_cast<float>(x), static_cast<float>(area.getY() + 10)); graphics.fillPath(pole); } }
         graphics.setFont(juce::FontOptions(10)); graphics.setColour(juce::Colours::lightgrey.withAlpha(0.7f));
         for (int tick = 0; tick <= 4; ++tick)
         { const int x = area.getX() + area.getWidth() * tick / 4;
@@ -430,12 +453,36 @@ public:
         graphics.setColour(colour); graphics.fillRect(overview.withX(overview.getX() + static_cast<float>(viewStart / length) * overview.getWidth()).withWidth(static_cast<float>(span() / length) * overview.getWidth()));
     }
 private:
+    int markerAt(juce::Point<float> point) const
+    {
+        const auto* track = findTrack(owner.presenter.project(), owner.trackId);
+        const auto* asset = track ? findId(owner.presenter.project().assets, track->sample) : nullptr;
+        const auto area = plot();
+        if (!track || !asset || asset->missing || span() <= 0 || !area.expanded(5).toFloat().contains(point)) return -1;
+        const auto start = area.getX() + (track->sampleOffset - viewStart) / span() * area.getWidth();
+        const auto end = area.getX() + (track->sampleOffset + track->sampleDuration - viewStart) / span() * area.getWidth();
+        const auto near = [&](double x) { return x >= area.getX() && x <= area.getRight() && std::abs(point.x - x) <= 8; };
+        if (near(end) && (!near(start) || std::abs(point.x - end) < std::abs(point.x - start))) return 1;
+        return near(start) ? 0 : -1;
+    }
+    void moveMarker(double seconds)
+    {
+        const auto* track = findTrack(owner.presenter.project(), owner.trackId);
+        const auto* asset = track ? findId(owner.presenter.project().assets, track->sample) : nullptr;
+        if (!asset || asset->missing || asset->sampleRate <= 0 || asset->length < 1) return;
+        const auto frame = 1 / asset->sampleRate, length = sourceLength();
+        const auto oldEnd = track->sampleOffset + track->sampleDuration;
+        seconds = std::round(seconds * asset->sampleRate) / asset->sampleRate;
+        const auto start = marker == 0 ? juce::jlimit(0.0, std::max(0.0, oldEnd - frame), seconds) : track->sampleOffset;
+        const auto end = marker == 1 ? juce::jlimit(std::min(length, start + frame), length, seconds) : oldEnd;
+        owner.presenter.loadSampler(owner.trackId, track->sample, start, end - start);
+    }
     void changeListenerCallback(juce::ChangeBroadcaster*) override { dirty = true; repaint(); }
     class Needle final : public juce::Component
     { void paint(juce::Graphics& graphics) override { graphics.fillAll(juce::Colours::white.withAlpha(0.85f)); } } needle;
     MidiEditor& owner; juce::String path, sourceError; juce::ThreadPool sourceLoader {1}; juce::AudioFormatManager formats;
     WaveformDetail detail; juce::AudioThumbnailCache cache {4}; juce::AudioThumbnail thumbnail; juce::Path envelope;
-    double zoom = 1, viewStart = 0, dragStart = 0; float downX = 0; bool dirty = true, panning = false;
+    double zoom = 1, viewStart = 0, dragStart = 0; float downX = 0; bool dirty = true, panning = false; int marker = -1;
 };
 class MidiEditor::DeviceSurface final : public juce::Component
 {
@@ -484,11 +531,15 @@ class MidiEditor::PluginCard final : public juce::Component
 public:
     PluginCard(MidiEditor& editor, juce::String identifier) : id(std::move(identifier)), owner(editor)
     {
+        if (const auto* plugin = model())
+        { juce::PluginDescription description; const auto xml = juce::XmlDocument::parse(plugin->description);
+          builtin = xml && description.loadFromXml(*xml) && description.pluginFormatName == "Opentone"; }
         setWantsKeyboardFocus(true); addAndMakeVisible(open); addAndMakeVisible(enabled);
         open.onClick = [this] { owner.presenter.plugins().showEditor(id); };
         enabled.getProperties().set("device-power", true); enabled.setTitle("Enable or disable device"); enabled.setClickingTogglesState(true);
         enabled.onClick = [this] { owner.presenter.bypassPlugin(owner.trackId, id, !enabled.getToggleState()); };
     }
+    ~PluginCard() override { clearEditor(); }
     const Plugin* model() const
     { const auto* track = findTrack(owner.presenter.project(), owner.trackId); return track ? findId(track->plugins, id) : nullptr; }
     int preferredWidth() const { return embedded ? editorWidth + 16 : 192; }
@@ -496,9 +547,9 @@ public:
     {
         open.getProperties().set("midi-target", "plugin-device/" + id);
         const auto slot = owner.presenter.plugins().editorSlot(id);
-        if (editingSlot != slot) { embedded.reset(); editingSlot = slot; }
-        if (!embedded && editingSlot && editingSlot->builtin && editingSlot->instance && editingSlot->instance->hasEditor() && !editingSlot->instance->getActiveEditor())
-        { embedded.reset(editingSlot->instance->createEditorAndMakeActive()); if (embedded) { editorWidth = embedded->getWidth(); addAndMakeVisible(*embedded); } }
+        if (editingSlot != slot) { clearEditor(); editingSlot = slot; }
+        if (!embedded && editingSlot && builtin && editingSlot->instance && !editingSlot->instance->getActiveEditor())
+        { embedded.reset(editingSlot->instance->hasEditor() ? editingSlot->instance->createEditorAndMakeActive() : new juce::GenericAudioProcessorEditor(*editingSlot->instance)); if (embedded) { editorWidth = embedded->getWidth(); addAndMakeVisible(*embedded); } }
         if (embedded)
         {
             std::function<void(juce::Component&)> mark = [&](juce::Component& control)
@@ -506,7 +557,7 @@ public:
               for (int i = 0; i < control.getNumChildComponents(); ++i) mark(*control.getChildComponent(i)); };
             mark(*embedded);
         }
-        open.setVisible(!embedded);
+        open.setVisible(!builtin && !embedded);
         const bool unavailable = editingSlot && !editingSlot->loading && (!editingSlot->instance || editingSlot->error.isNotEmpty());
         open.setEnabled(editingSlot && editingSlot->instance && !unavailable); open.setButtonText(unavailable ? "Unavailable" : "Open");
         if (unavailable) open.getProperties().remove("midi-target");
@@ -518,7 +569,9 @@ public:
         const bool unavailable = editingSlot && !editingSlot->loading && (!editingSlot->instance || editingSlot->error.isNotEmpty());
         graphics.fillAll(panel); graphics.setColour(unavailable ? juce::Colour(0xffb48179) : juce::Colour(0xff617f85)); graphics.fillRect(0, 0, getWidth(), 20);
         graphics.setColour(juce::Colours::black); graphics.setFont(juce::FontOptions(11));
-        graphics.drawText((unavailable ? "Unavailable: " : "") + plugin->name, 6, 0, getWidth() - 34, 20, juce::Justification::centredLeft, true);
+        const auto* source = findTrack(owner.presenter.project(), plugin->sidechain);
+        const auto title = plugin->name + (source ? " — Sidechain: " + source->name : juce::String());
+        graphics.drawText((unavailable ? "Unavailable: " : "") + title, 6, 0, getWidth() - 34, 20, juce::Justification::centredLeft, true);
         graphics.setColour(ink); const auto message = owner.presenter.plugins().status(id);
         if (!embedded) graphics.drawFittedText(unavailable ? plugin->name + "\n" + message : message.isEmpty() ? (plugin->instrument ? "Instrument" : "Audio effect") : message,
                                8, 88, getWidth() - 16, getHeight() - 96, juce::Justification::topLeft, 3);
@@ -530,12 +583,12 @@ public:
     {
         owner.presenter.selectTrack(owner.trackId); grabKeyboardFocus();
         if (event.mods.isPopupMenu())
-        { juce::PopupMenu menu; menu.addItem(1, "Open plug-in", editingSlot && editingSlot->instance != nullptr); menu.addItem(2, "Delete");
+        { juce::PopupMenu menu; if (!builtin) menu.addItem(1, "Open plug-in", editingSlot && editingSlot->instance != nullptr); menu.addItem(2, "Delete");
           juce::WeakReference<EditorPresenter> presenterRef(&owner.presenter); const auto track = owner.trackId, plugin = id;
           menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this), [presenterRef, track, plugin](int choice)
           { if (!presenterRef) return; if (choice == 1) presenterRef->plugins().showEditor(plugin); if (choice == 2) presenterRef->removePlugin(track, plugin); }); }
     }
-    void mouseDoubleClick(const juce::MouseEvent&) override { owner.presenter.plugins().showEditor(id); }
+    void mouseDoubleClick(const juce::MouseEvent&) override { if (!builtin) owner.presenter.plugins().showEditor(id); }
     void mouseDrag(const juce::MouseEvent& event) override
     {
         if (!event.mods.isLeftButtonDown() || event.getMouseDownY() >= 20 || event.getDistanceFromDragStart() < 4) return;
@@ -547,8 +600,10 @@ public:
       { const auto track = owner.trackId, plugin = id; owner.presenter.removePlugin(track, plugin); return true; } return false; }
     juce::String id;
 private:
+    void clearEditor()
+    { if (embedded) embedded->getAudioProcessor()->editorBeingDeleted(embedded.get()); embedded.reset(); }
     MidiEditor& owner; juce::TextButton open {"Open plug-in"}, enabled {"On"};
-    std::shared_ptr<PluginHost::Slot> editingSlot; std::unique_ptr<juce::AudioProcessorEditor> embedded; int editorWidth = 192;
+    std::shared_ptr<PluginHost::Slot> editingSlot; std::unique_ptr<juce::AudioProcessorEditor> embedded; int editorWidth = 192; bool builtin = false;
 };
 MidiEditor::MidiEditor(EditorPresenter& owner)
     : presenter(owner), roll(std::make_unique<Roll>(*this)), waveform(std::make_unique<Waveform>(*this)), deviceHeader(std::make_unique<DeviceHeader>(*this)), samplerSurface(std::make_unique<DeviceSurface>())
@@ -591,9 +646,9 @@ MidiEditor::MidiEditor(EditorPresenter& owner)
     deviceContent.addMouseListener(this, false); deviceContent.addAndMakeVisible(*samplerSurface); deviceContent.addAndMakeVisible(dropEffects);
     dropEffects.setJustificationType(juce::Justification::centred); dropEffects.setInterceptsMouseClicks(false, false);
     for (auto* child : std::initializer_list<juce::Component*> { &load, &clips, &source, &rootLabel, &root }) samplerSurface->addAndMakeVisible(child);
-    for (auto* child : std::initializer_list<juce::Component*> { waveform.get(), &volumeLabel, &volume, &startLabel, &sampleStart, &endLabel, &sampleEnd }) samplerSurface->addAndMakeVisible(child);
+    for (auto* child : std::initializer_list<juce::Component*> { waveform.get(), &volumeLabel, &volume, &oneShot, &sampleLoop }) samplerSurface->addAndMakeVisible(child);
     samplerSurface->addAndMakeVisible(*deviceHeader);
-    label(rootLabel, "Root"); label(volumeLabel, "Gain"); label(startLabel, "Start (s)"); label(endLabel, "End (s)");
+    label(rootLabel, "Root"); label(volumeLabel, "Gain");
     root.setRange(0, 127, 1); root.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag); root.setTextBoxStyle(juce::Slider::TextBoxRight, false, 40, 18); setSliderDefault(root, 60);
     root.setColour(juce::Slider::textBoxTextColourId, ink); root.setColour(juce::Slider::textBoxBackgroundColourId, background);
     root.setTitle("Sampler root MIDI note; 60 is C4");
@@ -606,21 +661,12 @@ MidiEditor::MidiEditor(EditorPresenter& owner)
     volume.valueFromTextFunction = [](const juce::String& text) { return (text.containsIgnoreCase("inf") || text.containsChar(0x221e)) ? 0.0 : std::pow(10.0, text.getDoubleValue() / 20); }; volume.setTitle("Sampler volume; instrument output gain");
     volume.updateText();
     volume.onValueChange = [this] { presenter.setSamplerGain(trackId, volume.getValue()); };
-    sampleStart.setTitle("Sampler sample start in seconds"); sampleEnd.setTitle("Sampler sample end in seconds");
-    for (auto* slider : { &volume, &sampleStart, &sampleEnd })
-    {
-        slider->setColour(juce::Slider::textBoxTextColourId, ink); slider->setColour(juce::Slider::textBoxBackgroundColourId, background);
-        slider->onDragStart = [this] { presenter.beginGesture(); }; slider->onDragEnd = [this] { presenter.endGesture(false); };
-    }
-    for (auto* slider : { &sampleStart, &sampleEnd })
-    { slider->setSliderStyle(juce::Slider::IncDecButtons); slider->setTextBoxStyle(juce::Slider::TextBoxLeft, false, 68, 18); }
-    setSliderDefault(sampleStart, 0); setSliderDefault(sampleEnd, 1);
-    sampleStart.onValueChange = [this]
-    { if (const auto* track = findTrack(presenter.project(), trackId))
-        presenter.loadSampler(trackId, track->sample, sampleStart.getValue(), track->sampleOffset + track->sampleDuration - sampleStart.getValue()); };
-    sampleEnd.onValueChange = [this]
-    { if (const auto* track = findTrack(presenter.project(), trackId))
-        presenter.loadSampler(trackId, track->sample, track->sampleOffset, sampleEnd.getValue() - track->sampleOffset); };
+    volume.setColour(juce::Slider::textBoxTextColourId, ink); volume.setColour(juce::Slider::textBoxBackgroundColourId, background);
+    volume.onDragStart = [this] { presenter.beginGesture(); }; volume.onDragEnd = [this] { presenter.endGesture(false); };
+    oneShot.setTitle("Play the selected sample region through after note release");
+    sampleLoop.setTitle("Repeat the selected sample region while a note is held");
+    oneShot.onClick = [this] { presenter.setSamplerMode(trackId, oneShot.getToggleState(), false); };
+    sampleLoop.onClick = [this] { presenter.setSamplerMode(trackId, false, sampleLoop.getToggleState()); };
     load.onClick = [this] { chooseSource(); };
     clips.setTitle("Choose audio clip for sampler"); clips.onClick = [this] { if (onChooseClip) onChooseClip(clips); };
     viewport.setViewedComponent(roll.get(), false); viewport.setScrollOnDragMode(juce::Viewport::ScrollOnDragMode::never);
@@ -644,7 +690,7 @@ void MidiEditor::mouseDown(const juce::MouseEvent& event)
     if (showPiano || !event.mods.isPopupMenu()) return;
     const auto* track = findTrack(presenter.project(), trackId); if (!track) return;
     juce::PopupMenu menu;
-    if (track->midi && !track->sampler && (track->plugins.empty() || !track->plugins.front().instrument)) menu.addItem(1, "Add instrument...");
+    if (track->midi && !track->sampler && !std::any_of(track->plugins.begin(), track->plugins.end(), [](const auto& plugin) { return plugin.instrument; })) menu.addItem(1, "Add instrument...");
     menu.addItem(2, "Add effect..."); juce::Component::SafePointer<MidiEditor> safe(this);
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMousePosition(), [safe](int choice)
     { if (safe && choice != 0 && safe->onAddDevice) safe->onAddDevice(*safe, choice == 1); });
@@ -672,7 +718,7 @@ std::pair<double, double> MidiEditor::deviceViewRange() const
     const auto width = std::max(1, deviceContent.getWidth());
     return { static_cast<double>(deviceViewport.getViewPositionX()) / width, std::min(1.0, static_cast<double>(deviceViewport.getViewWidth()) / width) };
 }
-void MidiEditor::cancelGesture() { roll->finish(true); }
+void MidiEditor::cancelGesture() { waveform->finish(true); roll->finish(true); }
 void MidiEditor::selectAllNotes() { roll->selectAll(); }
 void MidiEditor::copyNotes() { roll->copy(); }
 void MidiEditor::pasteNotes() { roll->paste(); }
@@ -686,7 +732,7 @@ void MidiEditor::timerCallback()
 void MidiEditor::setContext(juce::String track, juce::String clip, bool piano)
 {
     const bool changed = trackId != track || clipId != clip;
-    if (trackId != track || clipId != clip || (showPiano && !piano)) roll->finish(true);
+    if (trackId != track || clipId != clip || showPiano != piano) { waveform->finish(true); roll->finish(true); }
     if (trackId != track || clipId != clip) roll->clearSelection();
     trackId = std::move(track); clipId = std::move(clip); showPiano = piano;
     volume.getProperties().set("midi-target", "track/" + trackId + "/sampler-volume");
@@ -720,7 +766,7 @@ void MidiEditor::refresh()
     const auto* track = findTrack(presenter.project(), trackId);
     const auto* asset = track ? findId(presenter.project().assets, track->sample) : nullptr;
     const bool installed = track && track->sampler; deviceHeader->update();
-    for (auto* control : std::initializer_list<juce::Component*> { &load, &clips, &root, &rootLabel, waveform.get(), deviceHeader.get(), &source, &volume, &volumeLabel, &sampleStart, &sampleEnd, &startLabel, &endLabel }) control->setVisible(installed && !showPiano);
+    for (auto* control : std::initializer_list<juce::Component*> { &load, &clips, &root, &rootLabel, waveform.get(), deviceHeader.get(), &source, &volume, &volumeLabel, &oneShot, &sampleLoop }) control->setVisible(installed && !showPiano);
     viewport.setVisible(showPiano); deviceViewport.setVisible(!showPiano);
     bool rebuild = pluginCards.size() != (track ? track->plugins.size() : 0);
     if (!rebuild && track) for (size_t i = 0; i < pluginCards.size(); ++i) if (pluginCards[i]->id != track->plugins[i].id) rebuild = true;
@@ -735,7 +781,7 @@ void MidiEditor::refresh()
     int deviceX = samplerWidth;
     for (auto& card : pluginCards) { card->setBounds(deviceX, 0, card->preferredWidth(), deviceContent.getHeight()); deviceX += card->preferredWidth() + 8; }
     dropEffects.setBounds(chainWidth, 0, std::max(0, deviceContent.getWidth() - chainWidth), deviceContent.getHeight());
-    label(dropEffects, track && track->midi && !installed && (track->plugins.empty() || !track->plugins.front().instrument)
+    label(dropEffects, track && track->midi && !installed && !std::any_of(track->plugins.begin(), track->plugins.end(), [](const auto& plugin) { return plugin.instrument; })
         ? "Drop Instrument or Audio Effects Here" : "Drop Audio Effects Here");
     samplerSurface->setBounds(0, 0, samplerWidth > 0 ? samplerWidth - 8 : 0, deviceContent.getHeight());
     auto instrument = samplerSurface->getLocalBounds().reduced(6);
@@ -743,33 +789,17 @@ void MidiEditor::refresh()
     auto bar = instrument.removeFromTop(18);
     load.setBounds(bar.removeFromRight(48)); bar.removeFromRight(4); clips.setBounds(bar.removeFromRight(64)); source.setBounds(bar);
     auto controls = instrument.removeFromBottom(42); instrument.removeFromBottom(4);
+    auto modes = instrument.removeFromLeft(84); instrument.removeFromLeft(4);
+    oneShot.setBounds(modes.removeFromTop(24)); sampleLoop.setBounds(modes.removeFromTop(24));
     waveform->setBounds(instrument);
-    const int column = controls.getWidth() / 4;
-    for (auto pair : { std::pair<juce::Label*, juce::Slider*> { &rootLabel, &root }, { &volumeLabel, &volume }, { &startLabel, &sampleStart }, { &endLabel, &sampleEnd } })
+    const int column = controls.getWidth() / 2;
+    for (auto pair : { std::pair<juce::Label*, juce::Slider*> { &rootLabel, &root }, { &volumeLabel, &volume } })
     { auto cell = controls.removeFromLeft(column).reduced(5, 0); pair.first->setBounds(cell.removeFromTop(13)); pair.second->setBounds(cell); }
     label(source, asset ? (asset->missing ? "Missing: " : "") + assetName(*asset) : "");
     source.setTooltip(asset ? asset->path : juce::String()); if (asset && asset->missing) source.setColour(juce::Label::textColourId, uiTone(UiTone::record));
     if (track) { root.setValue(track->rootNote, juce::dontSendNotification); volume.setValue(track->samplerGain, juce::dontSendNotification); }
-    const bool readable = track && asset && !asset->missing;
-    sampleStart.setEnabled(readable); sampleEnd.setEnabled(readable);
-    if (track && !readable)
-    {
-        const auto maximum = std::max(1.0, track->sampleOffset + track->sampleDuration);
-        sampleStart.setRange(0, maximum); sampleEnd.setRange(0, maximum);
-        sampleStart.setValue(track->sampleOffset, juce::dontSendNotification); sampleEnd.setValue(track->sampleOffset + track->sampleDuration, juce::dontSendNotification);
-    }
-    if (readable)
-    {
-        const auto frame = 1 / asset->sampleRate, length = static_cast<double>(asset->length) / asset->sampleRate;
-        const auto startMaximum = std::max(0.0, track->sampleOffset + track->sampleDuration - frame);
-        const auto endMinimum = track->sampleOffset + frame;
-        sampleStart.setRange(0, std::max(frame, startMaximum), frame);
-        sampleEnd.setRange(endMinimum < length ? endMinimum : 0, length, frame);
-        sampleEnd.setDoubleClickReturnValue(true, length);
-        sampleStart.setEnabled(startMaximum > 0); sampleEnd.setEnabled(endMinimum < length);
-        sampleStart.setNumDecimalPlacesToDisplay(3); sampleEnd.setNumDecimalPlacesToDisplay(3);
-        sampleStart.setValue(track->sampleOffset, juce::dontSendNotification); sampleEnd.setValue(track->sampleOffset + track->sampleDuration, juce::dontSendNotification);
-    }
+    oneShot.setToggleState(track && track->samplerOneShot, juce::dontSendNotification);
+    sampleLoop.setToggleState(track && track->samplerLoop, juce::dontSendNotification);
     const auto* value = findId(presenter.project().clips, clipId);
     for (auto* control : std::initializer_list<juce::Component*> { &loopToggle, &loopStartLabel, &loopStart, &loopLengthLabel, &loopLength, &clipLengthLabel, &clipLength, &horizontalZoom, &verticalZoom, &horizontalLabel, &verticalLabel }) control->setVisible(showPiano && value != nullptr);
     horizontalZoom.setValue(presenter.viewState().pianoZoom, juce::dontSendNotification); verticalZoom.setValue(presenter.viewState().pianoKeyHeight, juce::dontSendNotification);

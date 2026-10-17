@@ -25,10 +25,17 @@ struct Plugin
 {
     juce::String id, name, description, state;
     bool instrument = false, bypass = false;
+    juce::String sidechain;
 };
 inline bool operator==(const Plugin& a, const Plugin& b)
-{ return std::tie(a.id, a.name, a.description, a.state, a.instrument, a.bypass)
-      == std::tie(b.id, b.name, b.description, b.state, b.instrument, b.bypass); }
+{ return std::tie(a.id, a.name, a.description, a.state, a.instrument, a.bypass, a.sidechain)
+      == std::tie(b.id, b.name, b.description, b.state, b.instrument, b.bypass, b.sidechain); }
+inline bool isMidiEffect(const Plugin& plugin)
+{
+    if (plugin.description.length() > 65536) return false;
+    const auto xml = juce::XmlDocument::parse(plugin.description);
+    return xml && xml->getStringAttribute("category") == "MIDI Effect";
+}
 struct AutomationPoint { double time = 0, value = 0; double x1 = 1.0 / 3, y1 = 1.0 / 3, x2 = 2.0 / 3, y2 = 2.0 / 3; bool step = false; };
 inline bool operator==(const AutomationPoint& a, const AutomationPoint& b) { return std::tie(a.time, a.value, a.x1, a.y1, a.x2, a.y2, a.step) == std::tie(b.time, b.value, b.x1, b.y1, b.x2, b.y2, b.step); }
 inline double automationValue(const std::vector<AutomationPoint>& points, double time, double fallback)
@@ -54,6 +61,7 @@ struct Track
     bool midi = false; juce::String sample {};
     double sampleOffset = 0, sampleDuration = 0; int rootNote = 60;
     bool sampler = false;
+    bool samplerOneShot = false, samplerLoop = false;
     double samplerGain = 1; bool solo = false;
     std::vector<Plugin> plugins {};
     double pan = 0;
@@ -135,8 +143,8 @@ struct Project
     int numerator = 4, denominator = 4; std::vector<Locator> locators {}; std::vector<Scene> scenes {};
 };
 inline bool operator==(const Track& a, const Track& b)
-{ return std::tie(a.id, a.name, a.gain, a.mute, a.midi, a.sample, a.sampleOffset, a.sampleDuration, a.rootNote, a.sampler, a.samplerGain, a.solo, a.plugins, a.pan, a.volumeAutomation, a.panAutomation, a.samplerBypass, a.inputEnabled, a.outputEnabled, a.monitor, a.midiChannel, a.returnIndex, a.sends, a.group, a.groupCollapsed, a.parentGroup, a.color, a.height, a.folded, a.annotation, a.armed, a.muteAutomation, a.sendAutomation, a.outputTrack)
-      == std::tie(b.id, b.name, b.gain, b.mute, b.midi, b.sample, b.sampleOffset, b.sampleDuration, b.rootNote, b.sampler, b.samplerGain, b.solo, b.plugins, b.pan, b.volumeAutomation, b.panAutomation, b.samplerBypass, b.inputEnabled, b.outputEnabled, b.monitor, b.midiChannel, b.returnIndex, b.sends, b.group, b.groupCollapsed, b.parentGroup, b.color, b.height, b.folded, b.annotation, b.armed, b.muteAutomation, b.sendAutomation, b.outputTrack); }
+{ return std::tie(a.id, a.name, a.gain, a.mute, a.midi, a.sample, a.sampleOffset, a.sampleDuration, a.rootNote, a.samplerOneShot, a.samplerLoop, a.sampler, a.samplerGain, a.solo, a.plugins, a.pan, a.volumeAutomation, a.panAutomation, a.samplerBypass, a.inputEnabled, a.outputEnabled, a.monitor, a.midiChannel, a.returnIndex, a.sends, a.group, a.groupCollapsed, a.parentGroup, a.color, a.height, a.folded, a.annotation, a.armed, a.muteAutomation, a.sendAutomation, a.outputTrack)
+      == std::tie(b.id, b.name, b.gain, b.mute, b.midi, b.sample, b.sampleOffset, b.sampleDuration, b.rootNote, b.samplerOneShot, b.samplerLoop, b.sampler, b.samplerGain, b.solo, b.plugins, b.pan, b.volumeAutomation, b.panAutomation, b.samplerBypass, b.inputEnabled, b.outputEnabled, b.monitor, b.midiChannel, b.returnIndex, b.sends, b.group, b.groupCollapsed, b.parentGroup, b.color, b.height, b.folded, b.annotation, b.armed, b.muteAutomation, b.sendAutomation, b.outputTrack); }
 inline bool operator==(const Asset& a, const Asset& b)
 { return std::tie(a.id, a.path, a.sampleRate, a.channels, a.length, a.missing) == std::tie(b.id, b.path, b.sampleRate, b.channels, b.length, b.missing); }
 inline bool operator==(const Clip& a, const Clip& b)
@@ -289,17 +297,24 @@ inline juce::Result validate(const Project& project)
                 previous = point.time;
             }
         }
-        int instruments = track.sampler ? 1 : 0;
+        int instruments = track.sampler ? 1 : 0; bool midiPrefix = true;
         for (size_t index = 0; index < track.plugins.size(); ++index)
         {
             const auto& plugin = track.plugins[index];
             if (plugin.id.isEmpty() || !ids.insert(plugin.id).second || plugin.description.isEmpty()
                 || plugin.description.length() > 65536 || plugin.state.length() > 16 * 1024 * 1024)
                 return juce::Result::fail("Invalid plug-in metadata or oversized plug-in state.");
-            if (plugin.instrument && (!track.midi || index != 0 || ++instruments > 1))
-                return juce::Result::fail("Only one instrument can be placed first on a MIDI track.");
+            if (plugin.sidechain.isNotEmpty())
+            { const auto* source = findTrack(project, plugin.sidechain);
+              if (!source || source->id == track.id || source->id == "master" || source->returnIndex >= 0 || routesTo(project, track, source->id)) return juce::Result::fail("Invalid sidechain source."); }
+            const auto midiEffect = isMidiEffect(plugin);
+            if (midiEffect && (!track.midi || track.sampler || !midiPrefix)) return juce::Result::fail("MIDI effects must precede the instrument on a MIDI track.");
+            if (plugin.instrument && (!track.midi || !midiPrefix || ++instruments > 1))
+                return juce::Result::fail("Only one instrument can follow MIDI effects on a MIDI track.");
+            if (!midiEffect) midiPrefix = false;
         }
         if (track.sampler && !track.midi) return juce::Result::fail("Instruments require a MIDI track.");
+        if (track.samplerOneShot && track.samplerLoop) return juce::Result::fail("Sampler modes cannot be combined.");
         if (!nonnegative(track.samplerGain) || track.samplerGain > 2) return juce::Result::fail("Sampler gain must be between zero and two.");
         if (!nonnegative(track.gain) || track.gain > 2) return juce::Result::fail("Track gain must be between zero and two.");
         if (track.rootNote < 0 || track.rootNote > 127 || !nonnegative(track.sampleOffset) || !nonnegative(track.sampleDuration))
@@ -316,6 +331,21 @@ inline juce::Result validate(const Project& project)
         if (asset.path.isEmpty() || !std::isfinite(asset.sampleRate) || asset.sampleRate <= 0
             || asset.sampleRate > 1000000 || asset.channels < 1 || asset.channels > 2 || asset.length <= 0)
             return juce::Result::fail("Invalid asset metadata.");
+    if (std::any_of(project.tracks.begin(), project.tracks.end(), [](const auto& track)
+        { return std::any_of(track.plugins.begin(), track.plugins.end(), [](const auto& plugin) { return plugin.sidechain.isNotEmpty(); }); }))
+    {
+        std::set<juce::String> complete, active;
+        std::function<bool(const Track&, int)> visit = [&](const auto& track, int depth)
+        {
+            if (complete.count(track.id)) return true;
+            if (depth > 64 || !active.insert(track.id).second) return false;
+            for (const auto& child : project.tracks) if (outputDestination(child) == track.id && !visit(child, depth + 1)) return false;
+            for (const auto& plugin : track.plugins) if (plugin.sidechain.isNotEmpty())
+                if (const auto* source = findTrack(project, plugin.sidechain)) if (!visit(*source, depth + 1)) return false;
+            active.erase(track.id); complete.insert(track.id); return true;
+        };
+        for (const auto& track : project.tracks) if (!visit(track, 0)) return juce::Result::fail("Cyclic or deep sidechain routing.");
+    }
     for (const auto& clip : project.clips)
     {
         if (clip.scene < -1 || clip.scene >= static_cast<int>(project.scenes.size()) || !nonnegative(clip.sessionLength) || clip.sessionLength > 1.0e9 || (clip.scene >= 0 && clip.sessionLength < 0.001)) return juce::Result::fail("Invalid session clip.");

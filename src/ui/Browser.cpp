@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "ui/Browser.h"
+#include "infrastructure/BuiltinPlugins.h"
 #include "ui/UiTheme.h"
 namespace opentone
 {
@@ -88,11 +89,12 @@ Browser::Browser(EditorPresenter& owner)
 }
 Browser::~Browser()
 {
+    presenter.stopLibraryPreview();
     ++*searchGeneration; searchPool.removeAllJobs(true, -1);
     files.removeListener(this); categories.setRootItem(nullptr); directoryThread.stopThread(-1);
 }
 void Browser::selectCategory(Category next, juce::String folder)
-{ category = next; selectedFolder = std::move(folder); preview->setFile({}); updateSource(); refresh(); }
+{ presenter.stopLibraryPreview(); category = next; selectedFolder = std::move(folder); preview->setFile({}); updateSource(); refresh(); }
 void Browser::rebuildPlaces()
 {
     root->clearSubItems();
@@ -170,7 +172,7 @@ void Browser::refresh()
     const auto selectedRow = list.getSelectedRow();
     const auto selectedItem = selectedRow >= 0 && selectedRow < static_cast<int>(rows.size()) ? rows[static_cast<size_t>(selectedRow)].drag : juce::String();
     rows.clear();
-    if (brandQuery != query) { brandQuery = query; collapsedSearchBrands.clear(); }
+    if (brandQuery != query) { brandQuery = query; collapsedSearchBrands.clear(); collapsedSearchInstruments.clear(); }
     if (sounds && !external)
         for (const auto& asset : presenter.project().assets)
             if (assetName(asset).containsIgnoreCase(query)) rows.push_back({ (asset.missing ? "! Missing: " : "") + assetName(asset), "asset:" + asset.id, {}, false });
@@ -178,21 +180,37 @@ void Browser::refresh()
         for (const auto& file : foundFiles) rows.push_back({file.getFileName(), "sample:" + file.getFullPathName(), {}, false});
     if (!sounds)
     {
-        if (category == Category::instruments && juce::String("Sampler").containsIgnoreCase(query)) rows.push_back({ "Sampler", "device:builtin:sampler", {}, false });
+        const auto matchesInstrument = [&](const juce::String& name, const juce::StringArray& presets)
+        { if (name.containsIgnoreCase(query)) return true; for (const auto& preset : presets) if (preset.containsIgnoreCase(query)) return true; return false; };
+        const auto samplerPresets = samplerPresetNames();
+        if (category == Category::instruments && matchesInstrument("Sampler", samplerPresets))
+            rows.push_back({"Sampler", "device:builtin:sampler", {}, false, {}, false, samplerPresets});
         std::map<juce::String, std::vector<Row>> brands;
         for (const auto& plugin : presenter.plugins().availablePlugins())
         {
             const bool native = plugin.pluginFormatName != "Opentone";
             const bool belongs = category == Category::plugins ? native : plugin.isInstrument == (category == Category::instruments);
             const auto brand = plugin.manufacturerName.trim().isEmpty() ? juce::String("Unknown Manufacturer") : plugin.manufacturerName.trim();
-            if (belongs && (plugin.name.containsIgnoreCase(query) || (native && brand.containsIgnoreCase(query))))
+            const auto presets = native || !plugin.isInstrument ? juce::StringArray() : builtinPresetNames(plugin.fileOrIdentifier);
+            if (belongs && (matchesInstrument(plugin.name, presets) || (native && brand.containsIgnoreCase(query))))
             {
-                Row item {plugin.name, "device:" + plugin.createIdentifierString(), !native ? juce::String() : plugin.pluginFormatName == "AudioUnit" ? "AU" : plugin.pluginFormatName, native, native ? brand : juce::String()};
+                Row item {plugin.name, "device:" + plugin.createIdentifierString(), !native ? juce::String() : plugin.pluginFormatName == "AudioUnit" ? "AU" : plugin.pluginFormatName, native, native ? brand : juce::String(), false, presets};
                 if (native) brands[brand].push_back(std::move(item)); else rows.push_back(std::move(item));
             }
         }
         const auto byName = [](const Row& a, const Row& b) { return a.name.compareIgnoreCase(b.name) < 0; };
         std::sort(rows.begin(), rows.end(), byName);
+        std::vector<Row> instruments;
+        for (auto& item : rows)
+        {
+            instruments.push_back(item);
+            jassert(item.presets.isEmpty() || (item.presets.size() == 20 && !item.plugin));
+            if (!item.presets.isEmpty() && instrumentOpen(item.drag))
+                for (int i = 0; i < item.presets.size(); ++i)
+                    if (item.name.containsIgnoreCase(query) || item.presets[i].containsIgnoreCase(query))
+                        instruments.push_back({item.presets[i], "device:preset:" + juce::String(i) + ":" + item.drag.substring(7), {}, false});
+        }
+        rows = std::move(instruments);
         for (auto& [brand, plugins] : brands)
         {
             jassert(brand.isNotEmpty() && !plugins.empty());
@@ -218,7 +236,13 @@ void Browser::paintListBoxItem(int row, juce::Graphics& g, int width, int height
     if (row < 0 || row >= getNumRows()) return;
     const auto& item = rows[static_cast<size_t>(row)]; if (selected) g.fillAll(accent);
     g.setColour(selected ? uiTone(UiTone::selectionText) : ink); g.setFont(juce::FontOptions(11));
-    const int indent = !item.folder && item.brand.isNotEmpty() ? 14 : 0;
+    const int indent = item.drag.startsWith("device:preset:") ? 28 : !item.presets.isEmpty() ? 14 : !item.folder && item.brand.isNotEmpty() ? 14 : 0;
+    if (!item.presets.isEmpty())
+    {
+        juce::Path arrow;
+        if (instrumentOpen(item.drag)) arrow.addTriangle(5, 8, 13, 8, 9, 13); else arrow.addTriangle(6, 6, 6, 14, 11, 10);
+        g.fillPath(arrow);
+    }
     if (item.folder)
     {
         const bool open = search.getText().trim().isEmpty() ? expandedBrands.contains(item.brand) : !collapsedSearchBrands.contains(item.brand);
@@ -252,6 +276,8 @@ void Browser::selectionChanged()
 void Browser::useFile(const juce::File& file)
 { if (file.existsAsFile()) presenter.importFiles({file.getFullPathName()}, presenter.viewState().selectedTrack,
     presenter.viewState().timeSelection ? presenter.viewState().timeSelection->start : presenter.position()); }
+void Browser::fileClicked(const juce::File& file, const juce::MouseEvent& event)
+{ if (event.mods.isLeftButtonDown() && event.getNumberOfClicks() == 1 && file.existsAsFile()) presenter.previewLibraryItem("sample:" + file.getFullPathName()); }
 void Browser::fileDoubleClicked(const juce::File& file) { useFile(file); }
 void Browser::activate(int index)
 {
@@ -268,6 +294,14 @@ void Browser::activate(int index)
         else presenter.insertClip({ newId(), track->id, asset->id, presenter.viewState().timeSelection ? presenter.viewState().timeSelection->start : presenter.position(), 0, duration }, false);
     }
 }
+bool Browser::instrumentOpen(const juce::String& id) const
+{ return search.getText().trim().isEmpty() ? expandedInstruments.contains(id) : !collapsedSearchInstruments.contains(id); }
+void Browser::toggleInstrument(const juce::String& id)
+{
+    auto& items = search.getText().trim().isEmpty() ? expandedInstruments : collapsedSearchInstruments;
+    if (items.contains(id)) items.removeString(id); else items.add(id);
+    refresh();
+}
 void Browser::toggleBrand(const juce::String& brand)
 {
     if (search.getText().trim().isEmpty())
@@ -276,13 +310,18 @@ void Browser::toggleBrand(const juce::String& brand)
     { if (collapsedSearchBrands.contains(brand)) collapsedSearchBrands.removeString(brand); else collapsedSearchBrands.add(brand); }
     refresh();
 }
-void Browser::listBoxItemDoubleClicked(int row, const juce::MouseEvent&)
-{ if (row >= 0 && row < getNumRows() && !rows[static_cast<size_t>(row)].folder) activate(row); }
+void Browser::listBoxItemDoubleClicked(int row, const juce::MouseEvent& event)
+{ if (row >= 0 && row < getNumRows() && !rows[static_cast<size_t>(row)].folder
+      && (rows[static_cast<size_t>(row)].presets.isEmpty() || event.x >= 18)) activate(row); }
 void Browser::listBoxItemClicked(int row, const juce::MouseEvent& event)
 {
     if (row < 0 || row >= getNumRows()) return;
+    if (!rows[static_cast<size_t>(row)].presets.isEmpty() && event.x < 18 && event.mods.isLeftButtonDown())
+    { if (event.getNumberOfClicks() == 1) toggleInstrument(rows[static_cast<size_t>(row)].drag); return; }
     if (rows[static_cast<size_t>(row)].folder)
     { if (event.mods.isLeftButtonDown() && event.getNumberOfClicks() == 1) toggleBrand(rows[static_cast<size_t>(row)].brand); return; }
+    if (event.mods.isLeftButtonDown() && event.getNumberOfClicks() == 1)
+        presenter.previewLibraryItem(rows[static_cast<size_t>(row)].drag);
     if (!event.mods.isPopupMenu() || !rows[static_cast<size_t>(row)].plugin) return;
     const auto id = rows[static_cast<size_t>(row)].drag.substring(7); bool instrument = false;
     for (const auto& plugin : presenter.plugins().availablePlugins()) if (plugin.createIdentifierString() == id) { instrument = plugin.isInstrument; break; }
@@ -293,7 +332,15 @@ void Browser::listBoxItemClicked(int row, const juce::MouseEvent& event)
 }
 bool Browser::keyPressed(const juce::KeyPress& key)
 {
+    if (key.getKeyCode() == juce::KeyPress::escapeKey) { presenter.stopLibraryPreview(); return true; }
     const auto row = list.getSelectedRow();
+    if (list.hasKeyboardFocus(true) && row >= 0 && row < getNumRows() && !rows[static_cast<size_t>(row)].presets.isEmpty()
+        && (key.getKeyCode() == juce::KeyPress::leftKey || key.getKeyCode() == juce::KeyPress::rightKey))
+    {
+        const auto id = rows[static_cast<size_t>(row)].drag;
+        if (instrumentOpen(id) != (key.getKeyCode() == juce::KeyPress::rightKey)) toggleInstrument(id);
+        return true;
+    }
     if (list.hasKeyboardFocus(true) && row >= 0 && row < getNumRows() && rows[static_cast<size_t>(row)].folder
         && (key.getKeyCode() == juce::KeyPress::leftKey || key.getKeyCode() == juce::KeyPress::rightKey))
     {

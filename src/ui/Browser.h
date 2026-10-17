@@ -25,7 +25,7 @@ public:
     bool canReload() const { return !choosing && searchPool.getNumJobs() == 0; }
 private:
     enum class Category { sounds, instruments, effects, plugins };
-    struct Row { juce::String name, drag, format; bool plugin = false; juce::String brand; bool folder = false; };
+    struct Row { juce::String name, drag, format; bool plugin = false; juce::String brand; bool folder = false; juce::StringArray presets; };
     class Folder;
     class Preview;
     void selectCategory(Category, juce::String folder = {});
@@ -34,10 +34,12 @@ private:
     void chooseFolder();
     void updateSource();
     void activate(int);
+    void toggleInstrument(const juce::String&);
+    bool instrumentOpen(const juce::String&) const;
     void toggleBrand(const juce::String&);
     void useFile(const juce::File&);
     void selectionChanged() override;
-    void fileClicked(const juce::File&, const juce::MouseEvent&) override {}
+    void fileClicked(const juce::File&, const juce::MouseEvent&) override;
     void fileDoubleClicked(const juce::File&) override;
     void browserRootChanged(const juce::File&) override {}
     EditorPresenter& presenter;
@@ -54,7 +56,7 @@ private:
     juce::FileTreeComponent files {directory};
     juce::StringArray cachedFolders;
     std::vector<Row> rows;
-    juce::StringArray expandedBrands, collapsedSearchBrands;
+    juce::StringArray expandedBrands, collapsedSearchBrands, expandedInstruments, collapsedSearchInstruments;
     juce::String brandQuery;
     juce::ThreadPool searchPool {1};
     std::shared_ptr<std::atomic<unsigned>> searchGeneration = std::make_shared<std::atomic<unsigned>>(0);

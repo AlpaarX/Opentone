@@ -38,6 +38,7 @@ public:
     }
     void mouseDown(const juce::MouseEvent& event) override
     {
+        if (event.mods.isMiddleButtonDown()) return;
         presenter.selectTrack(id); grabKeyboardFocus(); const auto* track = findTrack(presenter.project(), id); if (!track) return;
         const auto& points = presenter.automation(id);
         for (auto i = selected.begin(); i != selected.end();) if (*i < 0 || *i >= static_cast<int>(points.size())) i = selected.erase(i); else ++i;

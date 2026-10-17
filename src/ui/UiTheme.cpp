@@ -379,6 +379,17 @@ void setSliderDefault(juce::Slider& slider, double value)
     static Reset reset;
     slider.setDoubleClickReturnValue(true, value); slider.addMouseListener(&reset, true);
 }
+TrackVolumeSlider::TrackVolumeSlider(EditorPresenter& owner, juce::String id)
+    : presenter(&owner), track(std::move(id)) {}
+void TrackVolumeSlider::valueChanged()
+{
+    if (!presenter) return;
+    const auto* model = findTrack(presenter->project(), track); if (!model) return;
+    jassert(track != "master" || model == &presenter->project().master);
+    // Commit before a UI refresh can restore the old value during numeric-field dragging.
+    if (track == "master") presenter->setMaster(static_cast<float>(getValue()));
+    else presenter->controls(track, getValue(), model->mute);
+}
 void SendSlider::bind(EditorPresenter& owner, juce::String id, int target, int height)
 {
     presenter = &owner; track = std::move(id); index = target;
